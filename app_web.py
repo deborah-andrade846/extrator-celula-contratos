@@ -11,14 +11,14 @@ import pandas as pd
 import re
 import io
 
-# 1. Configuração direta das colunas (elimina o config.json!)
+# 1. Configuração direta das colunas (elimina o config.json)
 COLUNAS_CONFIG = {
     "hotel": ["Arquivo", "Data", "Informação adicional", "Qtde", "Unidade", "Total"],
     "exames": ["Arquivo", "Exame", "Valor"],
     "refeicoes": ["Arquivo", "Data", "Total"]
 }
 
-# 2. Função de limpeza mantida exatamente igual
+# 2. Função de limpeza para os relatórios do hotel
 def limpar_linha_hotel(linha, nome_hospede):
     padrao_data = r'^(\d{2}/\d{2}/\d{2})'
     match = re.search(padrao_data, linha.strip())
@@ -61,7 +61,6 @@ tipo_selecionado = st.radio(
 )
 
 st.markdown("### 2. Selecione os ficheiros PDF:")
-# O uploader do Streamlit permite arrastar vários ficheiros de uma vez
 arquivos_selecionados = st.file_uploader("Arraste e solte ou clique para procurar", type=['pdf'], accept_multiple_files=True)
 
 # 4. Botão de Extração
@@ -71,13 +70,11 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
     else:
         dados_finais = []
         
-        # Cria uma barra de carregamento a rodar enquanto processa
         with st.spinner("A processar ficheiros..."):
             for arquivo_pdf in arquivos_selecionados:
                 nome_arquivo = arquivo_pdf.name
                 
                 try:
-                    # O pdfplumber lê o ficheiro carregado em memória pelo Streamlit
                     with pdfplumber.open(arquivo_pdf) as pdf:
                         texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
                         linhas = texto_completo.split('\n')
@@ -101,12 +98,17 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
                             for linha in linhas:
                                 if "R$" in linha:
                                     partes = linha.split("R$")
-                                    if len(partes) == 2:
-                                        dados_finais.append({
-                                            "Arquivo": nome_arquivo,
-                                            "Exame": partes[0].strip(),
-                                            "Valor": partes[1].strip()
-                                        })
+                                    # CORREÇÃO: Aceita linhas que tenham o R$ uma ou mais vezes
+                                    if len(partes) >= 2:
+                                        nome_exame = partes[0].replace('"', '').replace(',', '').strip()
+                                        valor_exame = "R$ " + partes[1].replace('"', '').replace(',', '').strip()
+                                        
+                                        if nome_exame:
+                                            dados_finais.append({
+                                                "Arquivo": nome_arquivo,
+                                                "Exame": nome_exame,
+                                                "Valor": valor_exame
+                                            })
 
                         elif tipo_selecionado == "refeicoes":
                             data_refeicao = "DATA_NAO_ENCONTRADA"
@@ -138,15 +140,11 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
         if dados_finais:
             st.success(f"Extração concluída com sucesso! Foram encontradas {len(dados_finais)} linhas.")
             
-            # Converte para DataFrame do pandas
             df = pd.DataFrame(dados_finais, columns=COLUNAS_CONFIG[tipo_selecionado])
-            
-            # Cria o Excel em memória (não guarda nada no computador de forma permanente)
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                 df.to_excel(writer, index=False)
             
-            # Cria o botão de download mágico do Streamlit
             st.download_button(
                 label="📥 Descarregar Tabela em Excel",
                 data=buffer.getvalue(),
