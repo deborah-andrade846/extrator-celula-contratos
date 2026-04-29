@@ -2,7 +2,7 @@
 """
 Criado em Mon Apr  6 11:22:01 2026
 @author: deborah.goncalves
-Atualizado com extração de Notas Fiscais (PDF) – dois formatos e estatísticas confiáveis
+Atualizado com extração de Notas Fiscais (PDF) – dois formatos e estatísticas precisas
 """
 
 import streamlit as st
@@ -50,12 +50,11 @@ def limpar_linha_hotel(linha, nome_hospede):
     return None
 
 
-# --- Fiscal (com estatísticas melhoradas) ---
+# --- Fiscal (duas estratégias, formato A revisado) ---
 def _extrair_formato_a(arquivo_pdf):
     """
     Formato com fornecedor (ex.: AnexoSNE89701).
-    Retorna (dados, total_linhas_fiscais, nao_capturadas).
-    Agora 'total_linhas_fiscais' conta apenas linhas que começam com data+NF+chave.
+    Retorna (dados, total_fiscais, nao_capturadas).
     """
     dados = []
     total_fiscais = 0
@@ -67,42 +66,50 @@ def _extrair_formato_a(arquivo_pdf):
                 continue
             for linha in texto.split('\n'):
                 linha = linha.strip()
-                # Ignora linhas claramente não relacionadas a dados
                 if not linha or linha.startswith(('Data','TOTAIS','Página','ANEXO')):
                     continue
 
-                # Pré‑filtro: só conta se a linha começa com data e tem chave de 44 dígitos
+                # Pré‑filtro: linha deve começar com data, NF e chave de 44 dígitos
                 inicio = re.match(r'(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.+)', linha)
                 if not inicio:
                     continue
 
-                # A partir daqui sabemos que é uma linha fiscal
                 total_fiscais += 1
                 data = inicio.group(1)
                 nf = inicio.group(2)
                 chave = inicio.group(3)
-                restante = inicio.group(4)
+                restante = inicio.group(4).strip()
 
-                # Localiza UF – duas letras maiúsculas "soltas"
-                uf_match = re.search(r'\b([A-Z]{2})\b', restante)
-                if not uf_match:
+                # 1. Encontrar a UF: última palavra de exatamente duas letras maiúsculas
+                tokens = restante.split()
+                uf = None
+                idx_uf = -1
+                for i in range(len(tokens)-1, -1, -1):
+                    if re.fullmatch(r'[A-Z]{2}', tokens[i]):
+                        uf = tokens[i]
+                        idx_uf = i
+                        break
+                if uf is None:
                     nao_capturadas += 1
                     continue
-                uf = uf_match.group(1)
-                fornecedor = restante[:uf_match.start()].strip()
-                after_uf = restante[uf_match.end():].strip()
 
-                # Encontra o CFOP (4 dígitos) seguido de três valores monetários
-                valores_match = re.search(r'(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)', after_uf)
-                if not valores_match:
+                fornecedor = ' '.join(tokens[:idx_uf]).strip()
+                after_uf = ' '.join(tokens[idx_uf+1:])
+
+                # 2. No after_uf, encontrar o último bloco: CFOP + 3 valores monetários
+                m_valores = re.search(
+                    r'(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$',
+                    after_uf
+                )
+                if not m_valores:
                     nao_capturadas += 1
                     continue
 
-                cfop = valores_match.group(1)
-                valor_total = valores_match.group(2)
-                icms_origem = valores_match.group(3)
-                vr_difal = valores_match.group(4)
-                descricao = after_uf[:valores_match.start()].strip()
+                cfop = m_valores.group(1)
+                valor_total = m_valores.group(2)
+                icms_origem = m_valores.group(3)
+                vr_difal = m_valores.group(4)
+                descricao = after_uf[:m_valores.start()].strip()
 
                 dados.append({
                     'data_emissao': data,
@@ -120,14 +127,12 @@ def _extrair_formato_a(arquivo_pdf):
                     'icms_origem': icms_origem,
                     'valor_difal': vr_difal,
                 })
-
     return dados, total_fiscais, nao_capturadas
 
 
 def _extrair_formato_b(arquivo_pdf):
     """
     Formato B: Data | NF | Chave | UF | NCM | CFOP | Descrição | Valor NF | BC ICMS | ICMS | % Interna | DIFAL
-    Também usa pré‑filtro de data+NF+chave para contar linhas fiscais.
     """
     dados = []
     total_fiscais = 0
@@ -155,11 +160,8 @@ def _extrair_formato_b(arquivo_pdf):
                 linha = linha.strip()
                 if not linha or linha.startswith(('Data','TOTAIS','Página','ANEXO','OBS:')):
                     continue
-
-                # Pré‑filtro: a linha deve começar com data e ter uma chave de 44 dígitos
                 if not re.match(r'\d{2}/\d{2}/\d{4}\s+\d+\s+\d{44}', linha):
                     continue
-
                 total_fiscais += 1
                 m = padrao.search(linha)
                 if m:
@@ -186,13 +188,11 @@ def _extrair_formato_b(arquivo_pdf):
 
 def extrair_dados_fiscais_pdf(arquivo_pdf):
     """
-    Tenta os dois formatos.
-    Retorna (DataFrame, dict com estatísticas).
+    Tenta os dois formatos e retorna (DataFrame, estatísticas).
     """
     dados_a, tot_a, nao_a = _extrair_formato_a(arquivo_pdf)
     dados_b, tot_b, nao_b = _extrair_formato_b(arquivo_pdf)
 
-    # Escolhe o que gerou mais capturas
     if len(dados_a) >= len(dados_b):
         dados = dados_a
         total_fiscais = tot_a
@@ -221,10 +221,10 @@ def extrair_dados_fiscais_pdf(arquivo_pdf):
 
     estatisticas = {
         'Formato utilizado': formato_usado,
-        'Total de linhas com estrutura fiscal (data+NF+chave)': total_fiscais,
-        'Linhas capturadas com sucesso': len(dados),
-        'Linhas fiscais não reconhecidas': nao_capturadas,
-        'Percentual de captura': f"{(len(dados)/total_fiscais*100):.1f}%" if total_fiscais > 0 else "N/A"
+        'Linhas com estrutura fiscal': total_fiscais,
+        'Linhas capturadas': len(dados),
+        'Linhas não capturadas': nao_capturadas,
+        'Percentual': f"{(len(dados)/total_fiscais*100):.1f}%" if total_fiscais > 0 else "N/A"
     }
     return df, estatisticas
 
@@ -339,12 +339,12 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
             st.markdown("### 📊 Resumo da extração")
             for s in estatisticas_gerais:
                 with st.expander(f"📄 {s['Arquivo']} ({s['Formato utilizado']})"):
-                    st.write(f"✅ Linhas capturadas: **{s['Linhas capturadas com sucesso']}**")
-                    st.write(f"📄 Linhas com estrutura fiscal (data+NF+chave): **{s['Total de linhas com estrutura fiscal (data+NF+chave)']}**")
-                    st.write(f"⚠️ Linhas fiscais não reconhecidas: **{s['Linhas fiscais não reconhecidas']}**")
-                    st.write(f"📈 Percentual de captura: **{s['Percentual de captura']}**")
-                    if s['Linhas fiscais não reconhecidas'] > 0:
-                        st.warning("Algumas linhas com estrutura fiscal não foram capturadas. Pode ser necessário ajustar a regex caso sejam dados válidos.")
+                    st.write(f"✅ Linhas capturadas: **{s['Linhas capturadas']}**")
+                    st.write(f"📄 Linhas com estrutura fiscal: **{s['Linhas com estrutura fiscal']}**")
+                    st.write(f"⚠️ Linhas fiscais não capturadas: **{s['Linhas não capturadas']}**")
+                    st.write(f"📈 Percentual de captura: **{s['Percentual']}**")
+                    if s['Linhas não capturadas'] > 0:
+                        st.warning("Algumas linhas com estrutura fiscal não foram capturadas. Pode ser necessário ajuste adicional.")
 
         # ==================== GERAR EXCEL ====================
         if dados_finais:
