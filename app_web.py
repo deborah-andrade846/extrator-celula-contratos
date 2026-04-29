@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Extrator de Relatórios - Apoena
-Atualizado: Retorno da Formatação Visual (OpenPyXL) e Auditoria de Linhas
+Atualizado: Opção de Aba Única vs. Múltiplas Abas (Uma por PDF)
 """
 
 import streamlit as st
@@ -33,7 +33,7 @@ def converter_para_numero(valor_str):
     except:
         return valor_str
 
-# Ajuste fino nas Regex para ignorar espaços em branco no final da linha (\s*$)
+# Ajuste fino nas Regex
 padrao_89701 = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.*?)\s+([A-Z]{2})\s+(.*?)\s+(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$')
 padrao_92284 = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+([A-Z]{2})\s+(\d{8})\s+(\d{4})\s+(.*?)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*(.*?)\s*$')
 padrao_linha_fiscal_generica = re.compile(r'^\d{2}/\d{2}/\d{4}\s+\d+\s+\d{44}')
@@ -57,7 +57,6 @@ def extrair_linhas_fiscal(arquivo_pdf):
                 linha = linha.strip()
                 if not linha: continue
                 
-                # Se a linha tem cara de ser uma linha fiscal, registamos no auditor
                 if padrao_linha_fiscal_generica.match(linha):
                     estatisticas["Total Fiscais Encontradas"] += 1
                     
@@ -97,65 +96,80 @@ def extrair_linhas_fiscal(arquivo_pdf):
     return dados_locais, estatisticas
 
 # ==================== FORMATAÇÃO EXCEL VISUAL ====================
-def gerar_excel_formatado_em_memoria(df, tipo):
+def gerar_excel_formatado_em_memoria(df, tipo, modo_abas):
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Extração"
+    wb.remove(wb.active) # Remove a aba vazia padrão inicial
 
-    # Estilos exatos do seu código original
+    # Estilos de formatação
     header_font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="002060", end_color="002060", fill_type="solid")
     data_font = Font(name="Arial", size=10)
     alt_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
     thin = Side(border_style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    # Escrever Cabeçalho
-    headers = list(df.columns)
-    ws.append(headers)
-    for col_idx, cell in enumerate(ws[1], 1):
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border
-    ws.row_dimensions[1].height = 30
-
-    # Determinar quais colunas levam formatação de moeda
     colunas_moeda = ["Valor NF", "BC ICMS", "ICMS", "% Interna", "ICMS Origem", "VR DIFAL", "Total", "Valor"]
 
-    # Escrever Dados
-    for row_idx, row_data in enumerate(df.itertuples(index=False), 2):
-        ws.append(list(row_data))
-        fill = alt_fill if row_idx % 2 == 0 else None
-        
-        for col_idx, cell in enumerate(ws[row_idx], 1):
-            cell.font = data_font
-            cell.alignment = Alignment(vertical="center")
+    # Função interna para não repetir código ao formatar as abas
+    def preencher_e_formatar_aba(ws, df_aba, nome_aba):
+        # Excel não aceita abas com mais de 31 caracteres ou com certos símbolos especiais
+        nome_seguro = re.sub(r'[\\/*?:\[\]]', '', nome_aba)[:31]
+        ws.title = nome_seguro
+
+        # Escrever Cabeçalho
+        headers = list(df_aba.columns)
+        ws.append(headers)
+        for col_idx, cell in enumerate(ws[1], 1):
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = border
-            if fill:
-                cell.fill = fill
+        ws.row_dimensions[1].height = 30
+
+        # Escrever Dados
+        for row_idx, row_data in enumerate(df_aba.itertuples(index=False), 2):
+            ws.append(list(row_data))
+            fill = alt_fill if row_idx % 2 == 0 else None
             
-            nome_coluna = headers[col_idx - 1]
-            if nome_coluna in colunas_moeda and cell.value is not None:
-                try:
-                    cell.number_format = "#,##0.00"
-                    cell.alignment = Alignment(horizontal="right", vertical="center")
-                except:
-                    pass
+            for col_idx, cell in enumerate(ws[row_idx], 1):
+                cell.font = data_font
+                cell.alignment = Alignment(vertical="center")
+                cell.border = border
+                if fill: cell.fill = fill
+                
+                nome_coluna = headers[col_idx - 1]
+                if nome_coluna in colunas_moeda and cell.value is not None:
+                    try:
+                        cell.number_format = "#,##0.00"
+                        cell.alignment = Alignment(horizontal="right", vertical="center")
+                    except: pass
 
-    # Larguras das colunas
-    if tipo == "fiscal":
-        col_widths = [20, 10, 12, 10, 48, 35, 5, 10, 45, 7, 14, 14, 14, 12, 14, 14, 15]
+        # Larguras das colunas
+        if tipo == "fiscal":
+            col_widths = [20, 10, 12, 10, 48, 35, 5, 10, 45, 7, 14, 14, 14, 12, 14, 14, 15]
+        else:
+            col_widths = [20, 15, 30, 10, 10, 15]
+            
+        for i, w in enumerate(col_widths, 1):
+            if i <= len(headers):
+                ws.column_dimensions[get_column_letter(i)].width = w
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+    # ---------------- Lógica de criação de abas ----------------
+    if modo_abas == "unica":
+        # Cria apenas uma aba com tudo
+        ws_unica = wb.create_sheet("Extração Completa")
+        preencher_e_formatar_aba(ws_unica, df, "Extração Completa")
     else:
-        col_widths = [20, 15, 30, 10, 10, 15]
-        
-    for i, w in enumerate(col_widths, 1):
-        if i <= len(headers):
-            ws.column_dimensions[get_column_letter(i)].width = w
-
-    # Painel fixo e filtro
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+        # Cria uma aba para cada ficheiro PDF único encontrado no DataFrame
+        arquivos_unicos = df['Arquivo'].unique()
+        for arquivo in arquivos_unicos:
+            ws_nova = wb.create_sheet()
+            df_filtrado = df[df['Arquivo'] == arquivo]
+            # Usa o nome do ficheiro (sem o '.pdf' para poupar espaço) como título
+            titulo_aba = arquivo.replace(".pdf", "").replace(".PDF", "")
+            preencher_e_formatar_aba(ws_nova, df_filtrado, titulo_aba)
 
     # Guardar em buffer
     buffer = io.BytesIO()
@@ -167,6 +181,7 @@ def gerar_excel_formatado_em_memoria(df, tipo):
 st.set_page_config(page_title="Extrator de Relatórios - Apoena", page_icon="📊")
 st.title("📊 Extrator de Relatórios - Apoena")
 
+st.markdown("### 1. O que deseja extrair?")
 tipo_selecionado = st.radio(
     "Escolha o tipo de relatório:",
     options=["fiscal", "hotel", "exames", "refeicoes"],
@@ -175,9 +190,19 @@ tipo_selecionado = st.radio(
         "exames": "Exames Ocupacionais (Biomed)",
         "refeicoes": "Mapa de Refeições",
         "fiscal": "Notas Fiscais (Autuação SEFAZ)"
-    }[x]
+    }[x],
+    label_visibility="collapsed"
 )
 
+st.markdown("### 2. Como organizar o Excel?")
+modo_abas = st.radio(
+    "Organização das abas:",
+    options=["unica", "separadas"],
+    format_func=lambda x: "📑 Todos os PDFs numa única Aba (Planilha)" if x == "unica" else "📁 Cada PDF numa Aba (Planilha) separada",
+    label_visibility="collapsed"
+)
+
+st.markdown("### 3. Ficheiros PDF")
 arquivos_selecionados = st.file_uploader("Arraste os ficheiros PDF aqui", type=['pdf'], accept_multiple_files=True)
 
 if st.button("Extrair Dados e Gerar Excel", type="primary"):
@@ -196,13 +221,11 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
                         todas_estatisticas.append(stats)
                     else:
                         st.warning("Por favor, implemente as funções de Hotel/Exames se necessitar delas.")
-                        # (Omitido aqui por brevidade, pode colar as lógicas antigas se precisar do hotel/exames)
 
                 except Exception as e:
                     st.error(f"Erro ao processar {arquivo_pdf.name}:\n{str(e)}")
                     st.stop()
 
-        # Apresentar o Resumo de Auditoria para dar Certeza
         if tipo_selecionado == "fiscal":
             st.markdown("### 🔍 Auditoria da Extração")
             for stats in todas_estatisticas:
@@ -217,11 +240,11 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
         if dados_finais:
             df = pd.DataFrame(dados_finais, columns=COLUNAS_CONFIG[tipo_selecionado])
             
-            # Chama a função de formatação para criar o Excel bonito
-            buffer_excel = gerar_excel_formatado_em_memoria(df, tipo_selecionado)
+            # Passa a escolha do utilizador ('unica' ou 'separadas') para a função geradora
+            buffer_excel = gerar_excel_formatado_em_memoria(df, tipo_selecionado, modo_abas)
             
             st.download_button(
-                label="📥 Descarregar Excel Formatado e Colorido",
+                label="📥 Descarregar Excel Formatado",
                 data=buffer_excel,
                 file_name=f"Extracao_{tipo_selecionado}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
