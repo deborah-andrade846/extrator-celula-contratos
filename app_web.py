@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Extrator de Relatórios - Apoena
-Versão Final: Auditoria, Abas, Formatação e Padrão Misto (6 valores)
+Versão: Auditoria Avançada com Exportação de Linhas Rejeitadas
 """
 
 import streamlit as st
@@ -52,13 +52,8 @@ def limpar_linha_hotel(linha, nome_hospede):
     return None
 
 # ==================== EXPRESSÕES REGULARES (REGEX) FISCAL ====================
-# Padrão 89701: Fornecedor, sem NCM, 3 valores
 padrao_89701 = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.*?)\s+([A-Z]{2})\s+(.*?)\s+(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$')
-
-# Padrão 92284: Sem Fornecedor, com NCM, 5 valores
 padrao_92284 = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+([A-Z]{2})\s+(\d{8})\s+(\d{4})\s+(.*?)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*(.*?)\s*$')
-
-# Padrão Misto: Fornecedor, NCM e 6 valores (Resolve o erro da transportadora)
 padrao_misto = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.*?)\s+([A-Z]{2})\s+(\d{8})\s+(.*?)\s+(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$')
 
 padrao_linha_fiscal_generica = re.compile(r'^\d{2}/\d{2}/\d{4}\s+\d+\s+\d{44}')
@@ -66,7 +61,8 @@ padrao_linha_fiscal_generica = re.compile(r'^\d{2}/\d{2}/\d{4}\s+\d+\s+\d{44}')
 # ==================== MOTOR DE EXTRAÇÃO FISCAL ====================
 def extrair_linhas_fiscal(arquivo_pdf):
     dados_locais = []
-    estatisticas = {"Arquivo": arquivo_pdf.name, "Total Fiscais Encontradas": 0, "Sucesso": 0, "Falhas": 0, "Linhas com Erro": []}
+    linhas_rejeitadas = []
+    estatisticas = {"Arquivo": arquivo_pdf.name, "Total Fiscais Encontradas": 0, "Sucesso": 0, "Falhas": 0}
     
     with pdfplumber.open(arquivo_pdf) as pdf:
         for pagina in pdf.pages:
@@ -81,7 +77,7 @@ def extrair_linhas_fiscal(arquivo_pdf):
                     estatisticas["Total Fiscais Encontradas"] += 1
                     m1, m2, m3 = padrao_89701.match(linha), padrao_92284.match(linha), padrao_misto.match(linha)
                     
-                    if m3: # Caso Misto
+                    if m3:
                         dados_locais.append({
                             "Arquivo": arquivo_pdf.name, "Tipo NAI": "Misto", "Data": m3.group(1), "Nº NF": m3.group(2), "Chave da NF-e": m3.group(3),
                             "Fornecedor": m3.group(4).strip(), "UF": m3.group(5), "NCM": m3.group(6), "Descrição": m3.group(7).strip(), "CFOP": m3.group(8),
@@ -89,7 +85,7 @@ def extrair_linhas_fiscal(arquivo_pdf):
                             "% Interna": converter_para_numero(m3.group(12)), "ICMS Origem": converter_para_numero(m3.group(13)), "VR DIFAL": converter_para_numero(m3.group(14)), "OBS": ""
                         })
                         estatisticas["Sucesso"] += 1
-                    elif m1: # Caso 89701
+                    elif m1:
                         dados_locais.append({
                             "Arquivo": arquivo_pdf.name, "Tipo NAI": "89701", "Data": m1.group(1), "Nº NF": m1.group(2), "Chave da NF-e": m1.group(3),
                             "Fornecedor": m1.group(4).strip(), "UF": m1.group(5), "NCM": "", "Descrição": m1.group(6).strip(), "CFOP": m1.group(7),
@@ -97,7 +93,7 @@ def extrair_linhas_fiscal(arquivo_pdf):
                             "ICMS Origem": converter_para_numero(m1.group(9)), "VR DIFAL": converter_para_numero(m1.group(10)), "OBS": ""
                         })
                         estatisticas["Sucesso"] += 1
-                    elif m2: # Caso 92284
+                    elif m2:
                         dados_locais.append({
                             "Arquivo": arquivo_pdf.name, "Tipo NAI": "92284", "Data": m2.group(1), "Nº NF": m2.group(2), "Chave da NF-e": m2.group(3),
                             "Fornecedor": "", "UF": m2.group(4), "NCM": m2.group(5), "Descrição": m2.group(7).strip(), "CFOP": m2.group(6),
@@ -107,11 +103,13 @@ def extrair_linhas_fiscal(arquivo_pdf):
                         estatisticas["Sucesso"] += 1
                     else:
                         estatisticas["Falhas"] += 1
-                        estatisticas["Linhas com Erro"].append(linha)
-    return dados_locais, estatisticas
+                        # Guarda a linha rejeitada com a identificação do arquivo
+                        linhas_rejeitadas.append({"Arquivo": arquivo_pdf.name, "Linha Completa Não Processada": linha})
+                        
+    return dados_locais, linhas_rejeitadas, estatisticas
 
 # ==================== FORMATAÇÃO EXCEL VISUAL ====================
-def gerar_excel_formatado_em_memoria(df, tipo, modo_abas):
+def gerar_excel_formatado_em_memoria(df, df_erros, tipo, modo_abas):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     
@@ -148,6 +146,26 @@ def gerar_excel_formatado_em_memoria(df, tipo, modo_abas):
     else:
         for arquivo in df['Arquivo'].unique():
             preencher_e_formatar_aba(wb.create_sheet(), df[df['Arquivo'] == arquivo], arquivo.replace(".pdf", ""))
+            
+    # Cria aba dedicada apenas para os erros (se existirem)
+    if not df_erros.empty:
+        ws_err = wb.create_sheet("⚠️ Linhas Rejeitadas")
+        ws_err.append(["Arquivo de Origem", "Linha Completa Não Processada"])
+        
+        # Formatação do cabeçalho da aba de erros
+        for cell in ws_err[1]:
+            cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid") # Vermelho
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = border
+            
+        for row_idx, row_data in enumerate(df_erros.itertuples(index=False), 2):
+            ws_err.append(list(row_data))
+            
+        ws_err.column_dimensions['A'].width = 30
+        ws_err.column_dimensions['B'].width = 150
+        ws_err.freeze_panes = "A2"
+        ws_err.auto_filter.ref = ws_err.dimensions
     
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -166,14 +184,16 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
     if not arquivos_selecionados:
         st.warning("Selecione um PDF.")
     else:
-        dados_finais, todas_estatisticas = [], []
+        dados_finais, dados_rejeitados, todas_estatisticas = [], [], []
         with st.spinner("Processando..."):
             for arquivo_pdf in arquivos_selecionados:
                 try:
                     if tipo_selecionado == "fiscal":
-                        res, stats = extrair_linhas_fiscal(arquivo_pdf)
-                        dados_finais.extend(res); todas_estatisticas.append(stats)
-                    else: # Lógica para outros relatórios (Hotel, Exames, Refeições)
+                        res, rej, stats = extrair_linhas_fiscal(arquivo_pdf)
+                        dados_finais.extend(res)
+                        dados_rejeitados.extend(rej)
+                        todas_estatisticas.append(stats)
+                    else: 
                         with pdfplumber.open(arquivo_pdf) as pdf:
                             texto = "\n".join([p.extract_text() or "" for p in pdf.pages])
                             linhas = texto.split('\n')
@@ -203,14 +223,19 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
         if tipo_selecionado == "fiscal":
             st.markdown("### 🔍 Auditoria")
             for s in todas_estatisticas:
-                if s["Falhas"] == 0: st.success(f"✅ **{s['Arquivo']}**: {s['Total Fiscais Encontradas']} linhas extraídas!")
+                if s["Falhas"] == 0: 
+                    st.success(f"✅ **{s['Arquivo']}**: Todas as {s['Total Fiscais Encontradas']} linhas extraídas!")
                 else:
-                    st.warning(f"⚠️ **{s['Arquivo']}**: {s['Sucesso']} sucesso, **{s['Falhas']} falhas**.")
-                    with st.expander("Ver falhas:"):
-                        for erro in s["Linhas com Erro"]: st.code(erro)
+                    st.warning(f"⚠️ **{s['Arquivo']}**: {s['Sucesso']} sucesso, **{s['Falhas']} falhas**. Verifique a aba 'Linhas Rejeitadas' no Excel gerado.")
 
-        if dados_finais:
-            df = pd.DataFrame(dados_finais, columns=COLUNAS_CONFIG[tipo_selecionado])
-            st.download_button("📥 Descarregar Excel Formatado", data=gerar_excel_formatado_em_memoria(df, tipo_selecionado, modo_abas), file_name=f"Extracao_{tipo_selecionado}.xlsx")
+        if dados_finais or dados_rejeitados:
+            df = pd.DataFrame(dados_finais, columns=COLUNAS_CONFIG[tipo_selecionado]) if dados_finais else pd.DataFrame(columns=COLUNAS_CONFIG[tipo_selecionado])
+            df_erros = pd.DataFrame(dados_rejeitados) if dados_rejeitados else pd.DataFrame()
+            
+            st.download_button(
+                "📥 Descarregar Excel Formatado (Com Auditoria)", 
+                data=gerar_excel_formatado_em_memoria(df, df_erros, tipo_selecionado, modo_abas), 
+                file_name=f"Extracao_{tipo_selecionado}.xlsx"
+            )
         else:
-            st.info("Sem dados.")
+            st.info("Nenhuma linha foi processada.")
