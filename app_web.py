@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Criado em Mon Apr  6 11:22:01 2026
-@author: deborah.goncalves
-Atualizado com extração de Notas Fiscais (Excel/CSV)
+Extrator de Relatórios - Apoena
+Inclui: Hotel, Exames, Refeições e Notas Fiscais (PDF)
 """
 
 import streamlit as st
@@ -10,7 +9,6 @@ import pdfplumber
 import pandas as pd
 import re
 import io
-from io import BytesIO
 
 # ==================== CONFIGURAÇÕES ====================
 COLUNAS_CONFIG = {
@@ -19,13 +17,12 @@ COLUNAS_CONFIG = {
     "refeicoes": ["Arquivo", "Data", "Total"],
     "fiscal": [
         "data_emissao", "numero_nf", "chave_nfe", "fornecedor", "uf",
-        "descricao", "cfop", "valor_total", "icms_origem", "valor_difal",
-        "ncm", "bc_icms", "percentual_interna", "observacao"
+        "descricao", "cfop", "valor_total", "icms_origem", "valor_difal"
     ]
 }
 
-# Mapeamento padrão para colunas fiscais (chaves em minúsculo)
-MAPA_COLUNAS_PADRAO = {
+# Mapeamento de cabeçalhos frequentes para colunas normalizadas
+MAPA_COLUNAS_FISCAIS = {
     'data': 'data_emissao',
     'data emissão': 'data_emissao',
     'nº n.f': 'numero_nf',
@@ -46,38 +43,28 @@ MAPA_COLUNAS_PADRAO = {
     'valor dos itens': 'valor_total',
     'valor nf.': 'valor_total',
     'valor total': 'valor_total',
-    'bc icms': 'bc_icms',
-    'base icms': 'bc_icms',
     'icms origem': 'icms_origem',
     'icms': 'icms_origem',
-    '% interna': 'percentual_interna',
-    'alíquota interna': 'percentual_interna',
     'vr difal': 'valor_difal',
     'difal': 'valor_difal',
-    'obs': 'observacao',
 }
-
-COLUNAS_OBRIGATORIAS = ['data_emissao', 'numero_nf', 'valor_total']
 
 # ==================== FUNÇÕES DE EXTRAÇÃO ====================
 
-# --- Hotel ---
+# --- Hotel (mantida) ---
 def limpar_linha_hotel(linha, nome_hospede):
     padrao_data = r'^(\d{2}/\d{2}/\d{2})'
     match = re.search(padrao_data, linha.strip())
-    
     if match:
         data = match.group(1)
         resto = linha[linha.find(data) + len(data):].strip()
         partes = resto.split()
-        
         if len(partes) >= 7 and "," in partes[-1] and "," in partes[-6]:
             total = partes[-1]
             unidade = partes[-5]
             qtde = partes[-6]
             info = " ".join(partes[1:-6]).replace("|", "-").strip()
             info = info.split(" - Comanda")[0].strip()
-            
             return {
                 "Arquivo": nome_hospede,
                 "Data": data,
@@ -88,124 +75,136 @@ def limpar_linha_hotel(linha, nome_hospede):
             }
     return None
 
-# --- Fiscal (nova) ---
-def extrair_dados_fiscais(arquivo, mapeamento=None, colunas_obrigatorias=None):
+# --- Fiscal (nova, para PDF) ---
+def extrair_dados_fiscais_pdf(arquivo_pdf):
     """
-    Extrai dados fiscais de um arquivo Excel ou CSV, normalizando as colunas.
+    Extrai a tabela de notas fiscais de um PDF e retorna um DataFrame normalizado.
     """
-    if mapeamento is None:
-        mapeamento = MAPA_COLUNAS_PADRAO
-    if colunas_obrigatorias is None:
-        colunas_obrigatorias = COLUNAS_OBRIGATORIAS
+    with pdfplumber.open(arquivo_pdf) as pdf:
+        # Tentar extração automática da tabela (funciona para a maioria dos PDFs)
+        tabelas = []
+        for pagina in pdf.pages:
+            tabela = pagina.extract_table()
+            if tabela:
+                tabelas.extend(tabela)
 
-    # 1. Carregar o arquivo conforme extensão
-    if isinstance(arquivo, str):
-        nome_arquivo = arquivo
-        if nome_arquivo.lower().endswith('.csv'):
-            df_raw = _ler_csv_com_delimitador(nome_arquivo)
+        if tabelas:
+            return _processar_tabela_extraida(tabelas)
         else:
-            df_raw = pd.read_excel(nome_arquivo, header=None, dtype=str)
-    else:
-        nome_arquivo = getattr(arquivo, 'name', 'arquivo.csv')
-        ext = nome_arquivo.split('.')[-1].lower() if '.' in nome_arquivo else ''
-        if ext == 'csv':
-            content = arquivo.read()
-            df_raw = _ler_csv_com_delimitador(BytesIO(content))
-        else:
-            df_raw = pd.read_excel(arquivo, header=None, dtype=str)
+            # Fallback: extrair texto e parse linha a linha
+            texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
+            return _parse_texto_fiscal(texto_completo)
 
-    # Se múltiplas abas, tentar cada uma
-    if isinstance(df_raw, dict):
-        for sheet_name, df_sheet in df_raw.items():
-            try:
-                return _processar_sheet(df_sheet, mapeamento, colunas_obrigatorias)
-            except ValueError:
-                continue
-        raise ValueError("Nenhuma aba contém as colunas obrigatórias.")
-
-    return _processar_sheet(df_raw, mapeamento, colunas_obrigatorias)
-
-def _ler_csv_com_delimitador(arquivo):
-    """Tenta ler CSV detectando delimitador."""
-    try:
-        if isinstance(arquivo, BytesIO):
-            raw_bytes = arquivo.read()
-            arquivo.seek(0)
-            sample = raw_bytes[:4096].decode('utf-8', errors='ignore')
-        else:
-            with open(arquivo, 'rb') as f:
-                sample = f.read(4096).decode('utf-8', errors='ignore')
-
-        delimitadores = [',', ';', '\t', '|']
-        contagens = {d: sample.count(d) for d in delimitadores}
-        melhor = max(contagens, key=contagens.get)
-        if contagens[melhor] < 2:
-            melhor = ','
-        if isinstance(arquivo, BytesIO):
-            arquivo.seek(0)
-        return pd.read_csv(arquivo, sep=melhor, dtype=str, header=None, encoding='utf-8')
-    except Exception:
-        if isinstance(arquivo, BytesIO):
-            arquivo.seek(0)
-        return pd.read_csv(arquivo, sep=',', dtype=str, header=None, encoding='latin1')
-
-def _processar_sheet(df_raw, mapeamento, colunas_obrigatorias):
-    """Encontra cabeçalho e extrai dados de um DataFrame bruto."""
-    df = df_raw.astype(str).applymap(lambda x: x.strip())
-    df.replace(['nan', 'None', '', ' '], pd.NA, inplace=True)
-
-    idx_cabecalho = None
-    chaves_normalizadas = {k.lower(): v for k, v in mapeamento.items()}
-
-    for i, row in df.iterrows():
-        valores_linha = [str(v).lower().strip() for v in row if pd.notna(v)]
-        matches = sum(1 for v in valores_linha if v in chaves_normalizadas)
-        if matches >= max(2, len(colunas_obrigatorias) // 2):
-            idx_cabecalho = i
-            cabecalho_original = row.tolist()
-            break
-
-    if idx_cabecalho is None:
-        raise ValueError("Não foi possível localizar a linha de cabeçalho. Verifique o arquivo.")
-
-    mapa_colunas_pos = {}
-    for idx_col, nome_original in enumerate(cabecalho_original):
-        if pd.isna(nome_original):
+def _processar_tabela_extraida(tabela):
+    """
+    Recebe uma tabela extraída (lista de listas) e normaliza.
+    """
+    # A primeira linha é o cabeçalho
+    cabecalho = tabela[0]
+    # Mapear índices
+    mapa_idx = {}
+    for i, col_name in enumerate(cabecalho):
+        if col_name is None:
             continue
-        chave = str(nome_original).lower().strip()
-        if chave in chaves_normalizadas:
-            mapa_colunas_pos[idx_col] = chaves_normalizadas[chave]
+        chave = str(col_name).strip().lower()
+        if chave in MAPA_COLUNAS_FISCAIS:
+            mapa_idx[i] = MAPA_COLUNAS_FISCAIS[chave]
 
-    padronizadas_presentes = set(mapa_colunas_pos.values())
-    faltantes = set(colunas_obrigatorias) - padronizadas_presentes
-    if faltantes:
-        raise ValueError(f"Colunas obrigatórias não encontradas: {faltantes}. "
-                         f"Cabeçalhos detectados: {list(cabecalho_original)}")
+    if not mapa_idx:
+        raise ValueError("Não foi possível identificar as colunas no PDF.")
 
-    dados = df.iloc[idx_cabecalho + 1:].copy()
-    dados = dados.dropna(how='all')
-    mascara_titulo = dados.apply(lambda r: r.astype(str).str.match(r'^(Total|Subtotal|Pagina|Página)\b').any(), axis=1)
-    dados = dados[~mascara_titulo]
+    # Processar linhas de dados
+    dados = []
+    for linha in tabela[1:]:
+        registro = {}
+        for idx, col_padrao in mapa_idx.items():
+            valor = linha[idx] if idx < len(linha) else None
+            registro[col_padrao] = valor.strip() if valor else None
+        # Filtrar linhas completamente vazias
+        if any(v for v in registro.values()):
+            dados.append(registro)
 
-    if dados.empty:
-        raise ValueError("Nenhuma linha de dados encontrada após o cabeçalho.")
+    df = pd.DataFrame(dados)
+    return _converter_tipos(df)
 
-    colunas_utilizadas = sorted(mapa_colunas_pos.keys())
-    df_final = dados.iloc[:, colunas_utilizadas].copy()
-    df_final.columns = [mapa_colunas_pos[c] for c in colunas_utilizadas]
+def _parse_texto_fiscal(texto):
+    """
+    Parse alternativo para quando a tabela não é detectada.
+    Cobre os formatos dos seus dois prints.
+    """
+    linhas = texto.split('\n')
+    # Identificar linha de cabeçalho (contém palavras-chave)
+    cabecalho_idx = None
+    for i, linha in enumerate(linhas):
+        if any(palavra in linha.lower() for palavra in ['data', 'nº n.f', 'chave']):
+            cabecalho_idx = i
+            break
+    if cabecalho_idx is None:
+        raise ValueError("Cabeçalho da tabela fiscal não encontrado no PDF.")
 
-    # Conversão de tipos
-    if 'data_emissao' in df_final.columns:
-        df_final['data_emissao'] = pd.to_datetime(df_final['data_emissao'], dayfirst=True, errors='coerce')
+    # Extrair nomes das colunas (podem estar concatenados, ex: "DataNFISCAL...")
+    cabecalho_linha = linhas[cabecalho_idx]
+    # Tentar separar por espaços múltiplos ou por palavras-chave conhecidas
+    # Vamos usar uma abordagem mais robusta: procurar a posição de cada coluna pelo padrão
+    colunas_ordenadas = [
+        ('data', r'\bData\b'),
+        ('numero_nf', r'(N[º°]\s*N\.?\s*F|N\.?\s*Fiscal)'),
+        ('chave_nfe', r'Chave\s*(da\s*)?Nota\s*Fiscal\s*Eletr[ôó]nica'),
+        ('fornecedor', r'Fornecedor'),
+        ('uf', r'\bUF\b'),
+        ('ncm', r'\bNCM\b'),
+        ('cfop', r'\bCFOP\b'),
+        ('descricao', r'Descri[çc][ãa]o\s*(da\s*Mercadoria|do\s*Documento)'),
+        ('valor_total', r'Valor\s*(dos\s*Itens|NF\.?)'),
+        ('icms_origem', r'ICMS\s*Origem'),
+        ('valor_difal', r'(VR\s*DIFAL|DIFAL)'),
+    ]
+    posicoes = {}
+    cabecalho_lower = cabecalho_linha.lower()
+    for nome_padrao, regex in colunas_ordenadas:
+        match = re.search(regex, cabecalho_lower)
+        if match:
+            posicoes[nome_padrao] = match.start()
 
-    colunas_numericas = ['valor_total', 'bc_icms', 'icms_origem', 'percentual_interna', 'valor_difal']
+    if not posicoes:
+        raise ValueError("Não foi possível interpretar o cabeçalho fiscal.")
+
+    # Ordenar colunas pela posição
+    colunas_ordenadas = sorted(posicoes.keys(), key=lambda x: posicoes[x])
+
+    # Agora processar as linhas de dados (a partir da linha seguinte)
+    dados = []
+    for linha in linhas[cabecalho_idx+1:]:
+        linha = linha.strip()
+        if not linha or linha.startswith('Página') or linha.startswith('Total'):
+            continue
+        # Tentar particionar a linha pelas posições das colunas
+        registro = {}
+        for i, col in enumerate(colunas_ordenadas):
+            inicio = posicoes[col]
+            fim = posicoes[colunas_ordenadas[i+1]] if i+1 < len(colunas_ordenadas) else len(linha)
+            valor = linha[inicio:fim].strip()
+            if valor:
+                registro[col] = valor
+        if registro:
+            dados.append(registro)
+
+    df = pd.DataFrame(dados)
+    return _converter_tipos(df)
+
+def _converter_tipos(df):
+    """Converte colunas de data e numéricas (formato brasileiro)"""
+    if 'data_emissao' in df.columns:
+        df['data_emissao'] = pd.to_datetime(df['data_emissao'], dayfirst=True, errors='coerce')
+
+    colunas_numericas = ['valor_total', 'icms_origem', 'valor_difal']
     for col in colunas_numericas:
-        if col in df_final.columns:
-            df_final[col] = df_final[col].astype(str).str.replace('.', '', regex=False)
-            df_final[col] = df_final[col].str.replace(',', '.', regex=False)
-            df_final[col] = pd.to_numeric(df_final[col], errors='coerce')
-
-    return df_final.reset_index(drop=True)
+        if col in df.columns:
+            # Remover pontos de milhar e trocar vírgula decimal
+            df[col] = df[col].astype(str).str.replace('.', '', regex=False)
+            df[col] = df[col].str.replace(',', '.', regex=False)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
 
 # ==================== INTERFACE STREAMLIT ====================
 st.set_page_config(page_title="Extrator de Relatórios - Apoena", page_icon="📊")
@@ -219,28 +218,21 @@ tipo_selecionado = st.radio(
         "hotel": "Diárias e Consumo (Plaza Hotel)",
         "exames": "Exames Ocupacionais (Biomed)",
         "refeicoes": "Mapa de Refeições",
-        "fiscal": "Notas Fiscais (Excel/CSV)"
+        "fiscal": "Notas Fiscais (PDF)"
     }[x]
 )
 
-st.markdown("### 2. Selecione os ficheiros:")
-if tipo_selecionado == "fiscal":
-    arquivos_selecionados = st.file_uploader(
-        "Arraste e solte ficheiros Excel ou CSV",
-        type=['xlsx', 'xls', 'csv'],
-        accept_multiple_files=True
-    )
-else:
-    arquivos_selecionados = st.file_uploader(
-        "Arraste e solte ficheiros PDF",
-        type=['pdf'],
-        accept_multiple_files=True
-    )
+st.markdown("### 2. Selecione os ficheiros PDF:")
+arquivos_selecionados = st.file_uploader(
+    "Arraste e solte ou clique para procurar",
+    type=['pdf'],
+    accept_multiple_files=True
+)
 
 # ==================== BOTÃO DE EXTRAÇÃO ====================
 if st.button("Extrair Dados e Gerar Excel", type="primary"):
     if not arquivos_selecionados:
-        st.warning("Por favor, selecione pelo menos um ficheiro.")
+        st.warning("Por favor, selecione pelo menos um ficheiro PDF.")
     else:
         dados_finais = []
         
@@ -262,7 +254,7 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
                                     except:
                                         pass
                                     continue
-                                if "PLAZA HOTEL" in linha or "Apartamento:" in linha or "Fechado" in linha or "Pagamentos" in linha or "Tarifário:" in linha:
+                                if any(p in linha for p in ["PLAZA HOTEL", "Apartamento:", "Fechado", "Pagamentos", "Tarifário:"]):
                                     continue
                                 linha_extraida = limpar_linha_hotel(linha, nome_hospede)
                                 if linha_extraida:
@@ -308,12 +300,11 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
                                 })
 
                     elif tipo_selecionado == "fiscal":
-                        df_extraido = extrair_dados_fiscais(arquivo_pdf)
-                        # Converte o DataFrame para lista de dicionários e adiciona coluna do arquivo
-                        registros = df_extraido.to_dict('records')
-                        for registro in registros:
-                            registro['Arquivo'] = nome_arquivo
-                            dados_finais.append(registro)
+                        # Nova extração fiscal a partir de PDF
+                        df_fiscal = extrair_dados_fiscais_pdf(arquivo_pdf)
+                        # Adicionar nome do arquivo como coluna informativa
+                        df_fiscal['Arquivo'] = nome_arquivo
+                        dados_finais.extend(df_fiscal.to_dict('records'))
 
                 except Exception as e:
                     st.error(f"Erro ao processar o ficheiro {nome_arquivo}:\n{str(e)}")
@@ -321,14 +312,12 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
 
         # ==================== GERAR EXCEL ====================
         if dados_finais:
-            st.success(f"Extração concluída com sucesso! Foram encontradas {len(dados_finais)} linhas.")
+            st.success(f"Extração concluída! {len(dados_finais)} linhas extraídas.")
             
-            # Definir ordem das colunas conforme o tipo
-            colunas_excel = COLUNAS_CONFIG[tipo_selecionado]
-            # Para fiscal, o DataFrame pode ter colunas extras que não estão em colunas_excel
-            # Vamos filtrar apenas as que existem nos dados
             df = pd.DataFrame(dados_finais)
-            colunas_presentes = [c for c in colunas_excel if c in df.columns]
+            # Reordenar colunas conforme CONFIG, mantendo apenas as que existem
+            colunas_esperadas = COLUNAS_CONFIG[tipo_selecionado]
+            colunas_presentes = [c for c in colunas_esperadas if c in df.columns]
             df = df[colunas_presentes]
             
             buffer = io.BytesIO()
