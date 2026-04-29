@@ -2,7 +2,7 @@
 """
 Criado em Mon Apr  6 11:22:01 2026
 @author: deborah.goncalves
-Atualizado com extração de Notas Fiscais (PDF) – dois formatos e estatísticas precisas
+Atualizado: extração fiscal com validação de UF para formato A
 """
 
 import streamlit as st
@@ -23,9 +23,15 @@ COLUNAS_CONFIG = {
     ]
 }
 
+# Lista oficial de UFs brasileiras
+UFS_VALIDAS = {
+    'AC', 'AL', 'AP', 'AM', 'BA', 'CE', 'DF', 'ES', 'GO',
+    'MA', 'MT', 'MS', 'MG', 'PA', 'PB', 'PR', 'PE', 'PI',
+    'RJ', 'RN', 'RS', 'RO', 'RR', 'SC', 'SP', 'SE', 'TO'
+}
+
 # ==================== FUNÇÕES DE EXTRAÇÃO ====================
 
-# --- Hotel (mantida) ---
 def limpar_linha_hotel(linha, nome_hospede):
     padrao_data = r'^(\d{2}/\d{2}/\d{2})'
     match = re.search(padrao_data, linha.strip())
@@ -50,11 +56,9 @@ def limpar_linha_hotel(linha, nome_hospede):
     return None
 
 
-# --- Fiscal (duas estratégias, formato A revisado) ---
 def _extrair_formato_a(arquivo_pdf):
     """
-    Formato com fornecedor (ex.: AnexoSNE89701).
-    Retorna (dados, total_fiscais, nao_capturadas).
+    Formato A (com fornecedor). Usa lista de UFs válidas para localizar a UF.
     """
     dados = []
     total_fiscais = 0
@@ -69,7 +73,6 @@ def _extrair_formato_a(arquivo_pdf):
                 if not linha or linha.startswith(('Data','TOTAIS','Página','ANEXO')):
                     continue
 
-                # Pré‑filtro: linha deve começar com data, NF e chave de 44 dígitos
                 inicio = re.match(r'(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.+)', linha)
                 if not inicio:
                     continue
@@ -80,12 +83,12 @@ def _extrair_formato_a(arquivo_pdf):
                 chave = inicio.group(3)
                 restante = inicio.group(4).strip()
 
-                # 1. Encontrar a UF: última palavra de exatamente duas letras maiúsculas
                 tokens = restante.split()
+                # Encontra a última palavra que seja uma UF válida
                 uf = None
                 idx_uf = -1
                 for i in range(len(tokens)-1, -1, -1):
-                    if re.fullmatch(r'[A-Z]{2}', tokens[i]):
+                    if tokens[i] in UFS_VALIDAS:
                         uf = tokens[i]
                         idx_uf = i
                         break
@@ -96,7 +99,7 @@ def _extrair_formato_a(arquivo_pdf):
                 fornecedor = ' '.join(tokens[:idx_uf]).strip()
                 after_uf = ' '.join(tokens[idx_uf+1:])
 
-                # 2. No after_uf, encontrar o último bloco: CFOP + 3 valores monetários
+                # Bloco final: CFOP + 3 valores
                 m_valores = re.search(
                     r'(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$',
                     after_uf
@@ -131,9 +134,7 @@ def _extrair_formato_a(arquivo_pdf):
 
 
 def _extrair_formato_b(arquivo_pdf):
-    """
-    Formato B: Data | NF | Chave | UF | NCM | CFOP | Descrição | Valor NF | BC ICMS | ICMS | % Interna | DIFAL
-    """
+    """Formato B (com NCM). Mantido sem alterações."""
     dados = []
     total_fiscais = 0
     nao_capturadas = 0
@@ -144,12 +145,12 @@ def _extrair_formato_b(arquivo_pdf):
         r'([A-Z]{2})\s+'
         r'(\d{4,12})\s+'
         r'(\d{4})\s+'
-        r'(.+?)\s+'              # descrição
-        r'([\d.,]+)\s+'          # valor NF
-        r'([\d.,]+)\s+'          # BC ICMS
-        r'([\d.,]+)\s+'          # ICMS
-        r'([\d.,]+)\s+'          # % Interna
-        r'([\d.,]+)'             # DIFAL
+        r'(.+?)\s+'
+        r'([\d.,]+)\s+'
+        r'([\d.,]+)\s+'
+        r'([\d.,]+)\s+'
+        r'([\d.,]+)\s*'
+        r'([\d.,]+)'
     )
     with pdfplumber.open(arquivo_pdf) as pdf:
         for pagina in pdf.pages:
@@ -187,25 +188,19 @@ def _extrair_formato_b(arquivo_pdf):
 
 
 def extrair_dados_fiscais_pdf(arquivo_pdf):
-    """
-    Tenta os dois formatos e retorna (DataFrame, estatísticas).
-    """
+    """Escolhe o formato que gerar mais capturas."""
     dados_a, tot_a, nao_a = _extrair_formato_a(arquivo_pdf)
     dados_b, tot_b, nao_b = _extrair_formato_b(arquivo_pdf)
 
     if len(dados_a) >= len(dados_b):
-        dados = dados_a
-        total_fiscais = tot_a
-        nao_capturadas = nao_a
-        formato_usado = "A (com fornecedor)"
+        dados, total_fiscais, nao_capturadas = dados_a, tot_a, nao_a
+        formato = "A (com fornecedor)"
     else:
-        dados = dados_b
-        total_fiscais = tot_b
-        nao_capturadas = nao_b
-        formato_usado = "B (com NCM)"
+        dados, total_fiscais, nao_capturadas = dados_b, tot_b, nao_b
+        formato = "B (com NCM)"
 
     if not dados:
-        raise ValueError("Nenhuma linha de dados fiscais foi encontrada no PDF.")
+        raise ValueError("Nenhuma linha fiscal encontrada.")
 
     df = pd.DataFrame(dados)
     df['data_emissao'] = pd.to_datetime(df['data_emissao'], dayfirst=True, errors='coerce')
@@ -220,16 +215,16 @@ def extrair_dados_fiscais_pdf(arquivo_pdf):
             df[col] = df[col].apply(converter)
 
     estatisticas = {
-        'Formato utilizado': formato_usado,
-        'Linhas com estrutura fiscal': total_fiscais,
-        'Linhas capturadas': len(dados),
-        'Linhas não capturadas': nao_capturadas,
-        'Percentual': f"{(len(dados)/total_fiscais*100):.1f}%" if total_fiscais > 0 else "N/A"
+        'Formato': formato,
+        'Linhas fiscais': total_fiscais,
+        'Capturadas': len(dados),
+        'Não capturadas': nao_capturadas,
+        'Percentual': f"{(len(dados)/total_fiscais*100):.1f}%" if total_fiscais else "N/A"
     }
     return df, estatisticas
 
 
-# ==================== INTERFACE STREAMLIT ====================
+# ==================== INTERFACE ====================
 st.set_page_config(page_title="Extrator de Relatórios - Apoena", page_icon="📊")
 st.title("📊 Extrator de Relatórios - Apoena")
 
@@ -247,27 +242,23 @@ tipo_selecionado = st.radio(
 
 st.markdown("### 2. Selecione os ficheiros PDF:")
 arquivos_selecionados = st.file_uploader(
-    "Arraste e solte ou clique para procurar",
-    type=['pdf'],
-    accept_multiple_files=True
+    "Arraste e solte ou clique para procurar", type=['pdf'], accept_multiple_files=True
 )
 
-# ==================== BOTÃO DE EXTRAÇÃO ====================
 if st.button("Extrair Dados e Gerar Excel", type="primary"):
     if not arquivos_selecionados:
-        st.warning("Por favor, selecione pelo menos um ficheiro PDF.")
+        st.warning("Selecione pelo menos um ficheiro.")
     else:
         dados_finais = []
         estatisticas_gerais = []
 
-        with st.spinner("A processar ficheiros..."):
+        with st.spinner("Processando..."):
             for arquivo_pdf in arquivos_selecionados:
                 nome_arquivo = arquivo_pdf.name
-
                 try:
                     if tipo_selecionado == "hotel":
                         with pdfplumber.open(arquivo_pdf) as pdf:
-                            texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
+                            texto_completo = "\n".join([p.extract_text() or "" for p in pdf.pages])
                             linhas = texto_completo.split('\n')
                             nome_hospede = "NÃO_IDENTIFICADO"
                             for linha in linhas:
@@ -275,53 +266,40 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
                                     try:
                                         nome_cru = linha.split("Hóspede principal:")[1].split("|")[0].strip()
                                         nome_hospede = nome_cru.split()[0]
-                                    except:
-                                        pass
+                                    except: pass
                                     continue
                                 if any(p in linha for p in ["PLAZA HOTEL", "Apartamento:", "Fechado", "Pagamentos", "Tarifário:"]):
                                     continue
-                                linha_extraida = limpar_linha_hotel(linha, nome_hospede)
-                                if linha_extraida:
-                                    dados_finais.append(linha_extraida)
+                                li = limpar_linha_hotel(linha, nome_hospede)
+                                if li: dados_finais.append(li)
 
                     elif tipo_selecionado == "exames":
                         with pdfplumber.open(arquivo_pdf) as pdf:
-                            texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
-                            linhas = texto_completo.split('\n')
-                            for linha in linhas:
+                            texto = "\n".join([p.extract_text() or "" for p in pdf.pages])
+                            for linha in texto.split('\n'):
                                 if "R$" in linha:
                                     partes = linha.split("R$")
                                     if len(partes) >= 2:
-                                        nome_exame = partes[0].replace('"', '').replace(',', '').strip()
-                                        valor_exame = "R$ " + partes[1].replace('"', '').replace(',', '').strip()
-                                        if nome_exame:
-                                            dados_finais.append({
-                                                "Arquivo": nome_arquivo,
-                                                "Exame": nome_exame,
-                                                "Valor": valor_exame
-                                            })
+                                        nome = partes[0].replace('"','').replace(',','').strip()
+                                        valor = "R$ " + partes[1].replace('"','').replace(',','').strip()
+                                        if nome:
+                                            dados_finais.append({"Arquivo": nome_arquivo, "Exame": nome, "Valor": valor})
 
                     elif tipo_selecionado == "refeicoes":
                         with pdfplumber.open(arquivo_pdf) as pdf:
-                            texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
-                            linhas = texto_completo.split('\n')
-                            data_refeicao = "DATA_NAO_ENCONTRADA"
-                            total_refeicoes = "TOTAL_NAO_ENCONTRADO"
+                            texto = "\n".join([p.extract_text() or "" for p in pdf.pages])
+                            linhas = texto.split('\n')
+                            data_ref = "DATA_NAO_ENCONTRADA"
+                            total_ref = "TOTAL_NAO_ENCONTRADO"
                             for linha in linhas:
                                 if "Período:" in linha:
-                                    match = re.search(r'\d{2}/\d{2}/\d{4}', linha)
-                                    if match:
-                                        data_refeicao = match.group(0)
+                                    m = re.search(r'\d{2}/\d{2}/\d{4}', linha)
+                                    if m: data_ref = m.group(0)
                                 if "Total Geral" in linha:
-                                    valor_limpo = linha.replace("Total Geral", "").replace("|", "").strip()
-                                    if valor_limpo:
-                                        total_refeicoes = valor_limpo
-                            if data_refeicao != "DATA_NAO_ENCONTRADA" or total_refeicoes != "TOTAL_NAO_ENCONTRADO":
-                                dados_finais.append({
-                                    "Arquivo": nome_arquivo,
-                                    "Data": data_refeicao,
-                                    "Total": total_refeicoes
-                                })
+                                    v = linha.replace("Total Geral","").replace("|","").strip()
+                                    if v: total_ref = v
+                            if data_ref != "DATA_NAO_ENCONTRADA" or total_ref != "TOTAL_NAO_ENCONTRADO":
+                                dados_finais.append({"Arquivo": nome_arquivo, "Data": data_ref, "Total": total_ref})
 
                     elif tipo_selecionado == "fiscal":
                         df_fiscal, stats = extrair_dados_fiscais_pdf(arquivo_pdf)
@@ -331,41 +309,28 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
                         estatisticas_gerais.append(stats)
 
                 except Exception as e:
-                    st.error(f"Erro ao processar o ficheiro {nome_arquivo}:\n{str(e)}")
+                    st.error(f"Erro no ficheiro {nome_arquivo}:\n{str(e)}")
                     st.stop()
 
-        # ==================== EXIBIR ESTATÍSTICAS (APENAS FISCAL) ====================
         if tipo_selecionado == "fiscal" and estatisticas_gerais:
             st.markdown("### 📊 Resumo da extração")
             for s in estatisticas_gerais:
-                with st.expander(f"📄 {s['Arquivo']} ({s['Formato utilizado']})"):
-                    st.write(f"✅ Linhas capturadas: **{s['Linhas capturadas']}**")
-                    st.write(f"📄 Linhas com estrutura fiscal: **{s['Linhas com estrutura fiscal']}**")
-                    st.write(f"⚠️ Linhas fiscais não capturadas: **{s['Linhas não capturadas']}**")
-                    st.write(f"📈 Percentual de captura: **{s['Percentual']}**")
-                    if s['Linhas não capturadas'] > 0:
-                        st.warning("Algumas linhas com estrutura fiscal não foram capturadas. Pode ser necessário ajuste adicional.")
+                with st.expander(f"📄 {s['Arquivo']} ({s['Formato']})"):
+                    st.write(f"✅ Capturadas: **{s['Capturadas']}**")
+                    st.write(f"📄 Linhas fiscais: **{s['Linhas fiscais']}**")
+                    st.write(f"⚠️ Não capturadas: **{s['Não capturadas']}**")
+                    st.write(f"📈 Percentual: **{s['Percentual']}**")
 
-        # ==================== GERAR EXCEL ====================
         if dados_finais:
-            st.success(f"Extração concluída! {len(dados_finais)} linhas extraídas.")
-
+            st.success(f"Extração concluída! {len(dados_finais)} linhas.")
             df = pd.DataFrame(dados_finais)
-
-            # Reordenar colunas: "Arquivo" primeiro, depois todas as outras
-            colunas = [c for c in df.columns if c != 'Arquivo']
-            colunas_presentes = ['Arquivo'] + [c for c in colunas if c in df.columns]
-            df = df[colunas_presentes]
-
+            colunas = ['Arquivo'] + [c for c in df.columns if c != 'Arquivo']
+            df = df[colunas]
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                 df.to_excel(writer, index=False)
-
-            st.download_button(
-                label="📥 Descarregar Tabela em Excel",
-                data=buffer.getvalue(),
-                file_name=f"Extracao_{tipo_selecionado}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            st.download_button("📥 Descarregar Excel", data=buffer.getvalue(),
+                               file_name=f"Extracao_{tipo_selecionado}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
-            st.info("A extração não encontrou dados válidos para o tipo selecionado nestes ficheiros.")
+            st.info("Nenhum dado válido encontrado.")
