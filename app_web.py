@@ -2,7 +2,7 @@
 """
 Criado em Mon Apr  6 11:22:01 2026
 @author: deborah.goncalves
-Atualizado: extração fiscal com máxima resiliência (formato A)
+Atualizado: extração fiscal robusta a textos concatenados (formato A)
 """
 
 import streamlit as st
@@ -23,7 +23,6 @@ COLUNAS_CONFIG = {
     ]
 }
 
-# UFs brasileiras válidas
 UFS_VALIDAS = {
     'AC', 'AL', 'AP', 'AM', 'BA', 'CE', 'DF', 'ES', 'GO',
     'MA', 'MT', 'MS', 'MG', 'PA', 'PB', 'PR', 'PE', 'PI',
@@ -58,15 +57,19 @@ def limpar_linha_hotel(linha, nome_hospede):
 
 def _extrair_formato_a(arquivo_pdf):
     """
-    Formato A (com fornecedor). Extremamente resiliente:
-    - Só exige data + NF + chave de 44 dígitos.
-    - Tenta achar UF (última palavra de 2 letras maiúsculas na lista) e fornecedor.
-    - Tenta achar bloco CFOP + 3 valores; se falhar, tenta pegar os últimos 3 valores.
-    - Se não achar valores, campos numéricos ficam vazios.
+    Formato A (com fornecedor). Trata textos concatenados (sem espaços).
     """
     dados = []
     total_fiscais = 0
     nao_capturadas = 0
+
+    # Padrão para UF: duas letras maiúsculas isoladas, que sejam uma UF válida.
+    # Deve ser cercada por não-letra ou início/fim de string, e não ser parte de sigla maior.
+    uf_pattern = re.compile(r'(?<![A-Z])(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)(?![A-Z])')
+
+    # Padrão para o bloco final: CFOP (4 dígitos) + 3 valores monetários (com vírgula, opcionalmente com pontos)
+    # Exemplo concatenado: "21012.713,58167,72293,59"
+    bloco_pattern = re.compile(r'(\d{4})([\d.]+,\d{2})([\d.]+,\d{2})([\d.]+,\d{2})$')
 
     with pdfplumber.open(arquivo_pdf) as pdf:
         for pagina in pdf.pages:
@@ -79,7 +82,7 @@ def _extrair_formato_a(arquivo_pdf):
                     continue
 
                 # Pré‑filtro obrigatório: data + NF + chave de 44 dígitos
-                inicio = re.match(r'(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.+)', linha)
+                inicio = re.match(r'(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s*(.+)', linha)
                 if not inicio:
                     continue
 
@@ -89,64 +92,51 @@ def _extrair_formato_a(arquivo_pdf):
                 chave = inicio.group(3)
                 restante = inicio.group(4).strip()
 
-                # ---------- Tenta localizar UF ----------
-                tokens = restante.split()
-                uf = None
-                idx_uf = -1
-                for i in range(len(tokens)-1, -1, -1):
-                    if tokens[i] in UFS_VALIDAS:
-                        uf = tokens[i]
-                        idx_uf = i
-                        break
-
-                if uf:
-                    fornecedor = ' '.join(tokens[:idx_uf]).strip()
-                    after_uf = ' '.join(tokens[idx_uf+1:])
+                # ---- Localizar UF e fornecedor ----
+                uf_match = uf_pattern.search(restante)
+                if uf_match:
+                    uf = uf_match.group(1)
+                    fornecedor = restante[:uf_match.start()].strip()
+                    after_uf = restante[uf_match.end():].strip()
                 else:
+                    uf = ""
                     fornecedor = ""
                     after_uf = restante   # tudo após a chave
 
-                # ---------- Tenta achar bloco CFOP + 3 valores ----------
-                m_valores = re.search(
-                    r'(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$',
-                    after_uf
-                )
-                if m_valores:
-                    cfop = m_valores.group(1)
-                    valor_total = m_valores.group(2)
-                    icms_origem = m_valores.group(3)
-                    vr_difal = m_valores.group(4)
-                    descricao = after_uf[:m_valores.start()].strip()
+                # ---- Extrair bloco CFOP + 3 valores ----
+                bloco = bloco_pattern.search(after_uf)
+                if bloco:
+                    cfop = bloco.group(1)
+                    valor_total = bloco.group(2)
+                    icms_origem = bloco.group(3)
+                    vr_difal = bloco.group(4)
+                    descricao = after_uf[:bloco.start()].strip()
                 else:
-                    # Tenta pegar os últimos 3 valores monetários (fallback)
-                    valores_soltos = re.findall(r'[\d.,]+', after_uf)
-                    if len(valores_soltos) >= 3:
-                        # Assume que os três últimos são os valores
-                        vr_difal = valores_soltos[-1]
-                        icms_origem = valores_soltos[-2]
-                        valor_total = valores_soltos[-3]
-                        # Tenta achar CFOP antes desses valores (busca reversa)
-                        cfop_match = re.search(r'(\d{4})\s*$', after_uf[:after_uf.rfind(valores_soltos[-3])])
+                    # Fallback: tenta encontrar os últimos 3 valores no texto (pode estar com espaços)
+                    tokens = re.findall(r'[\d.]+\d,\d{2}', after_uf)
+                    if len(tokens) >= 3:
+                        vr_difal = tokens[-1]
+                        icms_origem = tokens[-2]
+                        valor_total = tokens[-3]
+                        # Tenta achar CFOP antes da posição do primeiro valor capturado
+                        idx_val = after_uf.rfind(tokens[-3])
+                        antes_vals = after_uf[:idx_val]
+                        cfop_match = re.search(r'(\d{4})\s*$', antes_vals)
                         cfop = cfop_match.group(1) if cfop_match else ""
-                        # Descrição: tudo antes do CFOP (ou antes do primeiro valor)
-                        idx_val = after_uf.rfind(valores_soltos[-3])
-                        descricao = after_uf[:idx_val].strip()
-                        if cfop and descricao.endswith(cfop):
-                            descricao = descricao[:-len(cfop)].strip()
+                        descricao = antes_vals[:cfop_match.start()].strip() if cfop_match else antes_vals.strip()
                     else:
-                        # Não foi possível identificar valores
                         cfop = ""
                         valor_total = ""
                         icms_origem = ""
                         vr_difal = ""
-                        descricao = after_uf   # tudo vira descrição
+                        descricao = after_uf
 
                 dados.append({
                     'data_emissao': data,
                     'numero_nf': nf,
                     'chave_nfe': chave,
                     'fornecedor': fornecedor,
-                    'uf': uf if uf else "",
+                    'uf': uf,
                     'ncm': None,
                     'descricao': descricao,
                     'cfop': cfop,
@@ -157,12 +147,11 @@ def _extrair_formato_a(arquivo_pdf):
                     'icms_origem': icms_origem,
                     'valor_difal': vr_difal,
                 })
-
     return dados, total_fiscais, nao_capturadas
 
 
 def _extrair_formato_b(arquivo_pdf):
-    """Formato B (com NCM). Mantido sem alterações."""
+    """Formato B (com NCM). Mantido como antes."""
     dados = []
     total_fiscais = 0
     nao_capturadas = 0
@@ -216,7 +205,6 @@ def _extrair_formato_b(arquivo_pdf):
 
 
 def extrair_dados_fiscais_pdf(arquivo_pdf):
-    """Escolhe o formato que gerar mais capturas."""
     dados_a, tot_a, nao_a = _extrair_formato_a(arquivo_pdf)
     dados_b, tot_b, nao_b = _extrair_formato_b(arquivo_pdf)
 
@@ -234,7 +222,7 @@ def extrair_dados_fiscais_pdf(arquivo_pdf):
     df['data_emissao'] = pd.to_datetime(df['data_emissao'], dayfirst=True, errors='coerce')
 
     def converter(v):
-        if isinstance(v, str) and v:
+        if isinstance(v, str) and v.strip():
             return float(v.replace('.', '').replace(',', '.'))
         return None
 
@@ -285,6 +273,7 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
                 nome_arquivo = arquivo_pdf.name
                 try:
                     if tipo_selecionado == "hotel":
+                        # ... (código hotel mantido)
                         with pdfplumber.open(arquivo_pdf) as pdf:
                             texto_completo = "\n".join([p.extract_text() or "" for p in pdf.pages])
                             linhas = texto_completo.split('\n')
