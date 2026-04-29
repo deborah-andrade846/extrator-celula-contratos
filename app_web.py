@@ -29,9 +29,10 @@ UFS_VALIDAS = {
     'RJ', 'RN', 'RS', 'RO', 'RR', 'SC', 'SP', 'SE', 'TO'
 }
 
-# ==================== FUNÇÕES ====================
+# ==================== FUNÇÕES DE HOTEL, EXAMES, REFEIÇÕES (mantidas) ====================
 
 def limpar_linha_hotel(linha, nome_hospede):
+    # ... (inalterado)
     padrao_data = r'^(\d{2}/\d{2}/\d{2})'
     match = re.search(padrao_data, linha.strip())
     if match:
@@ -64,12 +65,11 @@ def _extrair_formato_a(arquivo_pdf):
     nao_capturadas = 0
 
     # Padrão para UF: duas letras maiúsculas isoladas, que sejam uma UF válida.
-    # Deve ser cercada por não-letra ou início/fim de string, e não ser parte de sigla maior.
     uf_pattern = re.compile(r'(?<![A-Z])(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)(?![A-Z])')
 
-    # Padrão para o bloco final: CFOP (4 dígitos) + 3 valores monetários (com vírgula, opcionalmente com pontos)
-    # Exemplo concatenado: "21012.713,58167,72293,59"
-    bloco_pattern = re.compile(r'(\d{4})([\d.]+,\d{2})([\d.]+,\d{2})([\d.]+,\d{2})$')
+    # Padrão flexível para o bloco final: CFOP (4 dígitos) seguido de três valores monetários (com vírgula, 2 decimais)
+    # Aceita espaços ou pontos entre os grupos. NÃO exige fim de linha – captura a última ocorrência.
+    bloco_pattern = re.compile(r'(\d{4})\s*([\d.]+,\d{2})\s*([\d.]+,\d{2})\s*([\d.]+,\d{2})')
 
     with pdfplumber.open(arquivo_pdf) as pdf:
         for pagina in pdf.pages:
@@ -92,6 +92,9 @@ def _extrair_formato_a(arquivo_pdf):
                 chave = inicio.group(3)
                 restante = inicio.group(4).strip()
 
+                # ---- Pré-processamento: separar dígitos de letras (ex: "21012.713,58" → "2101 2.713,58")
+                restante = re.sub(r'(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])', ' ', restante)
+
                 # ---- Localizar UF e fornecedor ----
                 uf_match = uf_pattern.search(restante)
                 if uf_match:
@@ -103,33 +106,55 @@ def _extrair_formato_a(arquivo_pdf):
                     fornecedor = ""
                     after_uf = restante   # tudo após a chave
 
-                # ---- Extrair bloco CFOP + 3 valores ----
-                bloco = bloco_pattern.search(after_uf)
-                if bloco:
+                # ---- Extrair bloco CFOP + 3 valores (última ocorrência) ----
+                # Vamos procurar todas as ocorrências e pegar a última
+                matches = list(bloco_pattern.finditer(after_uf))
+                if matches:
+                    bloco = matches[-1]  # último conjunto CFOP+valores
                     cfop = bloco.group(1)
                     valor_total = bloco.group(2)
                     icms_origem = bloco.group(3)
                     vr_difal = bloco.group(4)
                     descricao = after_uf[:bloco.start()].strip()
                 else:
-                    # Fallback: tenta encontrar os últimos 3 valores no texto (pode estar com espaços)
-                    tokens = re.findall(r'[\d.]+\d,\d{2}', after_uf)
-                    if len(tokens) >= 3:
-                        vr_difal = tokens[-1]
-                        icms_origem = tokens[-2]
-                        valor_total = tokens[-3]
-                        # Tenta achar CFOP antes da posição do primeiro valor capturado
-                        idx_val = after_uf.rfind(tokens[-3])
+                    # ---- Fallback melhorado: captura números com vírgula (2 casas decimais) e tenta localizar o CFOP antes deles
+                    tokens_vals = re.findall(r'[\d.]+\d,\d{2}', after_uf)
+                    if len(tokens_vals) >= 3:
+                        # Pega os três últimos valores
+                        vr_difal = tokens_vals[-1]
+                        icms_origem = tokens_vals[-2]
+                        valor_total = tokens_vals[-3]
+                        # Procura um CFOP imediatamente antes do primeiro valor
+                        idx_val = after_uf.rfind(tokens_vals[-3])
                         antes_vals = after_uf[:idx_val]
                         cfop_match = re.search(r'(\d{4})\s*$', antes_vals)
                         cfop = cfop_match.group(1) if cfop_match else ""
                         descricao = antes_vals[:cfop_match.start()].strip() if cfop_match else antes_vals.strip()
                     else:
-                        cfop = ""
-                        valor_total = ""
-                        icms_origem = ""
-                        vr_difal = ""
-                        descricao = after_uf
+                        # Fallback extremo: converte números com mais de 2 casas decimais para 2 casas (arredondando)
+                        tokens_brutos = re.findall(r'[\d.]+\d,\d+', after_uf)
+                        tokens_arredondados = []
+                        for t in tokens_brutos:
+                            try:
+                                num = float(t.replace('.', '').replace(',', '.'))
+                                tokens_arredondados.append(f"{num:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.'))
+                            except:
+                                tokens_arredondados.append(t)
+                        if len(tokens_arredondados) >= 3:
+                            vr_difal = tokens_arredondados[-1]
+                            icms_origem = tokens_arredondados[-2]
+                            valor_total = tokens_arredondados[-3]
+                            idx_val = after_uf.rfind(tokens_brutos[-3])
+                            antes_vals = after_uf[:idx_val]
+                            cfop_match = re.search(r'(\d{4})\s*$', antes_vals)
+                            cfop = cfop_match.group(1) if cfop_match else ""
+                            descricao = antes_vals[:cfop_match.start()].strip() if cfop_match else antes_vals.strip()
+                        else:
+                            cfop = ""
+                            valor_total = ""
+                            icms_origem = ""
+                            vr_difal = ""
+                            descricao = after_uf
 
                 dados.append({
                     'data_emissao': data,
@@ -240,7 +265,7 @@ def extrair_dados_fiscais_pdf(arquivo_pdf):
     return df, estatisticas
 
 
-# ==================== INTERFACE ====================
+# ==================== INTERFACE (mantida) ====================
 st.set_page_config(page_title="Extrator de Relatórios - Apoena", page_icon="📊")
 st.title("📊 Extrator de Relatórios - Apoena")
 
