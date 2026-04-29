@@ -5,3 +5,5 @@ xlsxwriter
 openpyxl
 pytesseract
 pdf2image
+opencv-python-headless
+numpy
