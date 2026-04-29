@@ -2,7 +2,7 @@
 """
 Criado em Mon Apr  6 11:22:01 2026
 @author: deborah.goncalves
-Atualizado com extração de Notas Fiscais (PDF)
+Atualizado com extração de Notas Fiscais (PDF) – compatível com dois formatos
 """
 
 import streamlit as st
@@ -10,7 +10,6 @@ import pdfplumber
 import pandas as pd
 import re
 import io
-from io import BytesIO
 
 # ==================== CONFIGURAÇÕES ====================
 COLUNAS_CONFIG = {
@@ -18,8 +17,9 @@ COLUNAS_CONFIG = {
     "exames": ["Arquivo", "Exame", "Valor"],
     "refeicoes": ["Arquivo", "Data", "Total"],
     "fiscal": [
-        "Arquivo", "data_emissao", "numero_nf", "chave_nfe", "fornecedor", "uf",
-        "descricao", "cfop", "valor_total", "icms_origem", "valor_difal"
+        "Arquivo", "data_emissao", "numero_nf", "chave_nfe", "fornecedor", "uf", "ncm",
+        "descricao", "cfop", "valor_total", "bc_icms", "icms", "percentual_interna",
+        "icms_origem", "valor_difal"
     ]
 }
 
@@ -50,29 +50,50 @@ def limpar_linha_hotel(linha, nome_hospede):
     return None
 
 
-# --- Fiscal (nova, para PDF) ---
+# --- Fiscal (nova, compatível com dois formatos) ---
 def extrair_dados_fiscais_pdf(arquivo_pdf):
     """
     Extrai dados fiscais de um PDF de notas fiscais (Anexo I) e retorna um DataFrame.
-    Analisa o texto plano de todas as páginas.
+    Suporta dois formatos de tabela:
+      1. Data|NF|Chave|Fornecedor|UF|Descrição|CFOP|Valor Total|ICMS Origem|VR DIFAL
+      2. Data|NF|Chave|UF|NCM|CFOP|Descrição|Valor Total|BC ICMS|ICMS|% Interna|VR DIFAL
     """
-    # Padrão regex para uma linha de dados completa
-    padrao_linha = re.compile(
+
+    # Padrão 1: com fornecedor, sem NCM
+    padrao1 = re.compile(
         r'^'
-        r'(\d{2}/\d{2}/\d{4})\s+'          # data (grupo 1)
-        r'(\d+)\s+'                        # nº nf (grupo 2)
-        r'(\d{44})\s+'                     # chave NFe (grupo 3)
-        r'(.+?)\s+'                        # fornecedor (grupo 4) – captura mínima até a UF
-        r'([A-Z]{2})\s+'                   # UF (grupo 5)
-        r'(.+?)\s+'                        # descrição (grupo 6) – termina antes do CFOP
-        r'(\d{4})\s+'                      # CFOP (grupo 7)
-        r'([\d.]+,\d{2})\s+'              # valor total (grupo 8)
-        r'([\d.]+,\d{2})\s+'              # ICMS origem (grupo 9)
-        r'([\d.]+,\d{2})'                 # VR DIFAL (grupo 10)
+        r'(\d{2}/\d{2}/\d{4})\s+'          # data (1)
+        r'(\d+)\s+'                        # nº nf (2)
+        r'(\d{44})\s+'                     # chave NFe (3)
+        r'(.+?)\s{2,}'                     # fornecedor (4) – mínimo possível até dois espaços
+        r'([A-Z]{2})\s+'                   # UF (5)
+        r'(.+?)\s+'                        # descrição (6) – mínimo possível
+        r'(\d{4})\s+'                      # CFOP (7)
+        r'([\d.]+,\d{2})\s+'              # valor total (8)
+        r'([\d.]+,\d{2})\s+'              # ICMS origem (9)
+        r'([\d.]+,\d{2})'                 # VR DIFAL (10)
         r'\s*$'
     )
 
-    # Padrão para identificar linhas que devem ser ignoradas
+    # Padrão 2: sem fornecedor, com NCM, BC ICMS, ICMS, % Interna
+    padrao2 = re.compile(
+        r'^'
+        r'(\d{2}/\d{2}/\d{4})\s+'          # data (1)
+        r'(\d+)\s+'                        # nº nf (2)
+        r'(\d{44})\s+'                     # chave NFe (3)
+        r'([A-Z]{2})\s+'                   # UF (4)
+        r'(\d{4,12})\s+'                   # NCM (5)
+        r'(\d{4})\s+'                      # CFOP (6)
+        r'(.+?)\s+'                        # descrição (7) – mínimo possível
+        r'([\d.]+,\d{2})\s+'              # valor total (8)
+        r'([\d.]+,\d{2})\s+'              # BC ICMS (9)
+        r'([\d.]+,\d{2})\s+'              # ICMS (10)
+        r'([\d.]+,\d{2})\s+'              # % Interna (11)
+        r'([\d.]+,\d{2})'                 # VR DIFAL (12)
+        r'.*$'                             # ignora possível OBS
+    )
+
+    # Linhas que devem ser ignoradas
     padrao_ignorar = re.compile(
         r'^\s*(Data|TOTAIS\s+DO\s+MÊS|TOTAL\s+DO\s+MÊS|Página|TERMO DE CIÊNCIA|ANEXO|CONTRIBUINTE|DEMONSTRATIVO|Código da Infração|OBS:)',
         re.IGNORECASE
@@ -89,7 +110,9 @@ def extrair_dados_fiscais_pdf(arquivo_pdf):
                 linha = linha.strip()
                 if not linha or padrao_ignorar.match(linha):
                     continue
-                match = padrao_linha.match(linha)
+
+                # Tenta o formato 1
+                match = padrao1.match(linha)
                 if match:
                     dados.append({
                         'data_emissao': match.group(1),
@@ -97,29 +120,59 @@ def extrair_dados_fiscais_pdf(arquivo_pdf):
                         'chave_nfe': match.group(3),
                         'fornecedor': match.group(4).strip(),
                         'uf': match.group(5),
+                        'ncm': None,
                         'descricao': match.group(6).strip(),
                         'cfop': match.group(7),
                         'valor_total': match.group(8),
+                        'bc_icms': None,
+                        'icms': None,
+                        'percentual_interna': None,
                         'icms_origem': match.group(9),
                         'valor_difal': match.group(10),
                     })
+                    continue
+
+                # Tenta o formato 2
+                match = padrao2.match(linha)
+                if match:
+                    dados.append({
+                        'data_emissao': match.group(1),
+                        'numero_nf': match.group(2),
+                        'chave_nfe': match.group(3),
+                        'fornecedor': None,
+                        'uf': match.group(4),
+                        'ncm': match.group(5),
+                        'descricao': match.group(7).strip(),
+                        'cfop': match.group(6),
+                        'valor_total': match.group(8),
+                        'bc_icms': match.group(9),
+                        'icms': match.group(10),
+                        'percentual_interna': match.group(11),
+                        'icms_origem': None,
+                        'valor_difal': match.group(12),
+                    })
 
     if not dados:
-        raise ValueError("Nenhuma linha de dados fiscais foi encontrada no PDF. Verifique se o arquivo contém o Anexo I com as colunas Data, Nº N.F, Chave, etc.")
+        raise ValueError(
+            "Nenhuma linha de dados fiscais foi encontrada no PDF. "
+            "Verifique se o arquivo contém o Anexo I com as colunas Data, Nº N.F, Chave, etc."
+        )
 
     df = pd.DataFrame(dados)
 
-    # Conversão de tipos
+    # Converte datas
     df['data_emissao'] = pd.to_datetime(df['data_emissao'], dayfirst=True, errors='coerce')
 
-    # Converte valores monetários de formato brasileiro (1.234,56) para float
+    # Função para converter valores monetários brasileiros (1.234,56) para float
     def converter_moeda(valor):
         if isinstance(valor, str):
             return float(valor.replace('.', '').replace(',', '.'))
         return valor
 
-    for col in ['valor_total', 'icms_origem', 'valor_difal']:
-        df[col] = df[col].apply(converter_moeda)
+    colunas_monetarias = ['valor_total', 'bc_icms', 'icms', 'percentual_interna', 'icms_origem', 'valor_difal']
+    for col in colunas_monetarias:
+        if col in df.columns:
+            df[col] = df[col].apply(converter_moeda)
 
     return df
 
@@ -153,11 +206,11 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
         st.warning("Por favor, selecione pelo menos um ficheiro PDF.")
     else:
         dados_finais = []
-        
+
         with st.spinner("A processar ficheiros..."):
             for arquivo_pdf in arquivos_selecionados:
                 nome_arquivo = arquivo_pdf.name
-                
+
                 try:
                     if tipo_selecionado == "hotel":
                         with pdfplumber.open(arquivo_pdf) as pdf:
@@ -218,9 +271,7 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
                                 })
 
                     elif tipo_selecionado == "fiscal":
-                        # Nova extração fiscal a partir de PDF
                         df_fiscal = extrair_dados_fiscais_pdf(arquivo_pdf)
-                        # Adicionar nome do arquivo como coluna informativa
                         df_fiscal['Arquivo'] = nome_arquivo
                         dados_finais.extend(df_fiscal.to_dict('records'))
 
@@ -231,17 +282,19 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
         # ==================== GERAR EXCEL ====================
         if dados_finais:
             st.success(f"Extração concluída! {len(dados_finais)} linhas extraídas.")
-            
+
             df = pd.DataFrame(dados_finais)
-            # Reordenar colunas conforme CONFIG, mantendo apenas as que existem
-            colunas_esperadas = COLUNAS_CONFIG[tipo_selecionado]
-            colunas_presentes = [c for c in colunas_esperadas if c in df.columns]
+
+            # Reordenar colunas: "Arquivo" primeiro, depois todas as outras
+            colunas = [c for c in df.columns if c != 'Arquivo']
+            # Filtra apenas as colunas que realmente existem no DataFrame
+            colunas_presentes = ['Arquivo'] + [c for c in colunas if c in df.columns]
             df = df[colunas_presentes]
-            
+
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                 df.to_excel(writer, index=False)
-            
+
             st.download_button(
                 label="📥 Descarregar Tabela em Excel",
                 data=buffer.getvalue(),
