@@ -2,7 +2,7 @@
 """
 Criado em Mon Apr  6 11:22:01 2026
 @author: deborah.goncalves
-Atualizado: extração fiscal com tolerância a lacunas no formato A
+Atualizado: extração fiscal com máxima resiliência (formato A)
 """
 
 import streamlit as st
@@ -23,14 +23,14 @@ COLUNAS_CONFIG = {
     ]
 }
 
-# Lista oficial de UFs brasileiras
+# UFs brasileiras válidas
 UFS_VALIDAS = {
     'AC', 'AL', 'AP', 'AM', 'BA', 'CE', 'DF', 'ES', 'GO',
     'MA', 'MT', 'MS', 'MG', 'PA', 'PB', 'PR', 'PE', 'PI',
     'RJ', 'RN', 'RS', 'RO', 'RR', 'SC', 'SP', 'SE', 'TO'
 }
 
-# ==================== FUNÇÕES DE EXTRAÇÃO ====================
+# ==================== FUNÇÕES ====================
 
 def limpar_linha_hotel(linha, nome_hospede):
     padrao_data = r'^(\d{2}/\d{2}/\d{2})'
@@ -58,12 +58,16 @@ def limpar_linha_hotel(linha, nome_hospede):
 
 def _extrair_formato_a(arquivo_pdf):
     """
-    Formato A (com fornecedor). Robusto a lacunas: se não encontrar UF,
-    preenche fornecedor com todo o texto até o bloco de valores.
+    Formato A (com fornecedor). Extremamente resiliente:
+    - Só exige data + NF + chave de 44 dígitos.
+    - Tenta achar UF (última palavra de 2 letras maiúsculas na lista) e fornecedor.
+    - Tenta achar bloco CFOP + 3 valores; se falhar, tenta pegar os últimos 3 valores.
+    - Se não achar valores, campos numéricos ficam vazios.
     """
     dados = []
     total_fiscais = 0
     nao_capturadas = 0
+
     with pdfplumber.open(arquivo_pdf) as pdf:
         for pagina in pdf.pages:
             texto = pagina.extract_text()
@@ -74,7 +78,7 @@ def _extrair_formato_a(arquivo_pdf):
                 if not linha or linha.startswith(('Data','TOTAIS','Página','ANEXO')):
                     continue
 
-                # Pré‑filtro: data + NF + chave de 44 dígitos
+                # Pré‑filtro obrigatório: data + NF + chave de 44 dígitos
                 inicio = re.match(r'(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.+)', linha)
                 if not inicio:
                     continue
@@ -85,7 +89,7 @@ def _extrair_formato_a(arquivo_pdf):
                 chave = inicio.group(3)
                 restante = inicio.group(4).strip()
 
-                # Tenta localizar a UF (última palavra válida)
+                # ---------- Tenta localizar UF ----------
                 tokens = restante.split()
                 uf = None
                 idx_uf = -1
@@ -99,25 +103,43 @@ def _extrair_formato_a(arquivo_pdf):
                     fornecedor = ' '.join(tokens[:idx_uf]).strip()
                     after_uf = ' '.join(tokens[idx_uf+1:])
                 else:
-                    # Se não achou UF, assume que tudo após a chave é descrição + valores
                     fornecedor = ""
-                    after_uf = restante
+                    after_uf = restante   # tudo após a chave
 
-                # Procura o bloco CFOP + 3 valores (o último da linha)
-                # Aceita qualquer separador (espaços, tabs) e captura números com ponto ou vírgula
+                # ---------- Tenta achar bloco CFOP + 3 valores ----------
                 m_valores = re.search(
                     r'(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$',
                     after_uf
                 )
-                if not m_valores:
-                    nao_capturadas += 1
-                    continue
-
-                cfop = m_valores.group(1)
-                valor_total = m_valores.group(2)
-                icms_origem = m_valores.group(3)
-                vr_difal = m_valores.group(4)
-                descricao = after_uf[:m_valores.start()].strip()
+                if m_valores:
+                    cfop = m_valores.group(1)
+                    valor_total = m_valores.group(2)
+                    icms_origem = m_valores.group(3)
+                    vr_difal = m_valores.group(4)
+                    descricao = after_uf[:m_valores.start()].strip()
+                else:
+                    # Tenta pegar os últimos 3 valores monetários (fallback)
+                    valores_soltos = re.findall(r'[\d.,]+', after_uf)
+                    if len(valores_soltos) >= 3:
+                        # Assume que os três últimos são os valores
+                        vr_difal = valores_soltos[-1]
+                        icms_origem = valores_soltos[-2]
+                        valor_total = valores_soltos[-3]
+                        # Tenta achar CFOP antes desses valores (busca reversa)
+                        cfop_match = re.search(r'(\d{4})\s*$', after_uf[:after_uf.rfind(valores_soltos[-3])])
+                        cfop = cfop_match.group(1) if cfop_match else ""
+                        # Descrição: tudo antes do CFOP (ou antes do primeiro valor)
+                        idx_val = after_uf.rfind(valores_soltos[-3])
+                        descricao = after_uf[:idx_val].strip()
+                        if cfop and descricao.endswith(cfop):
+                            descricao = descricao[:-len(cfop)].strip()
+                    else:
+                        # Não foi possível identificar valores
+                        cfop = ""
+                        valor_total = ""
+                        icms_origem = ""
+                        vr_difal = ""
+                        descricao = after_uf   # tudo vira descrição
 
                 dados.append({
                     'data_emissao': data,
@@ -135,6 +157,7 @@ def _extrair_formato_a(arquivo_pdf):
                     'icms_origem': icms_origem,
                     'valor_difal': vr_difal,
                 })
+
     return dados, total_fiscais, nao_capturadas
 
 
@@ -211,9 +234,9 @@ def extrair_dados_fiscais_pdf(arquivo_pdf):
     df['data_emissao'] = pd.to_datetime(df['data_emissao'], dayfirst=True, errors='coerce')
 
     def converter(v):
-        if isinstance(v, str):
+        if isinstance(v, str) and v:
             return float(v.replace('.', '').replace(',', '.'))
-        return v
+        return None
 
     for col in ['valor_total','bc_icms','icms','percentual_interna','icms_origem','valor_difal']:
         if col in df.columns:
