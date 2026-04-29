@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Extrator de Relatórios - Apoena
-Atualizado: Opção de Aba Única vs. Múltiplas Abas (Uma por PDF)
+Atualizado: Opção de Abas, Excel Formatado e Padrão Misto Integrado
 """
 
 import streamlit as st
@@ -33,11 +33,21 @@ def converter_para_numero(valor_str):
     except:
         return valor_str
 
-# Ajuste fino nas Regex
+# ==================== EXPRESSÕES REGULARES (REGEX) ====================
+# Padrão Original 89701 (Tem Fornecedor, sem NCM, 3 valores finais)
 padrao_89701 = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.*?)\s+([A-Z]{2})\s+(.*?)\s+(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$')
+
+# Padrão Original 92284 (Sem Fornecedor, com NCM, 5 valores finais)
 padrao_92284 = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+([A-Z]{2})\s+(\d{8})\s+(\d{4})\s+(.*?)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*(.*?)\s*$')
+
+# NOVO: Padrão Misto (Tem Fornecedor, tem NCM, 6 valores finais - Resolve os erros identificados)
+padrao_misto = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.*?)\s+([A-Z]{2})\s+(\d{8})\s+(.*?)\s+(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$')
+
+# Padrão genérico apenas para detetar se a linha é ou não é uma linha de Nota Fiscal
 padrao_linha_fiscal_generica = re.compile(r'^\d{2}/\d{2}/\d{4}\s+\d+\s+\d{44}')
 
+
+# ==================== MOTOR DE EXTRAÇÃO ====================
 def extrair_linhas_fiscal(arquivo_pdf):
     dados_locais = []
     estatisticas = {
@@ -62,8 +72,24 @@ def extrair_linhas_fiscal(arquivo_pdf):
                     
                     m1 = padrao_89701.match(linha)
                     m2 = padrao_92284.match(linha)
+                    m3 = padrao_misto.match(linha)
                     
-                    if m1:
+                    if m3: # 1º Teste: Formato Misto (Completo)
+                        dados_locais.append({
+                            "Arquivo": arquivo_pdf.name, "Tipo NAI": "Misto",
+                            "Data": m3.group(1), "Nº NF": m3.group(2), "Chave da NF-e": m3.group(3),
+                            "Fornecedor": m3.group(4).strip(), "UF": m3.group(5), "NCM": m3.group(6),
+                            "Descrição": m3.group(7).strip(), "CFOP": m3.group(8),
+                            "Valor NF": converter_para_numero(m3.group(9)), 
+                            "BC ICMS": converter_para_numero(m3.group(10)),
+                            "ICMS": converter_para_numero(m3.group(11)), 
+                            "% Interna": converter_para_numero(m3.group(12)),
+                            "ICMS Origem": converter_para_numero(m3.group(13)), 
+                            "VR DIFAL": converter_para_numero(m3.group(14)), "OBS": ""
+                        })
+                        estatisticas["Sucesso"] += 1
+                        
+                    elif m1: # 2º Teste: Formato 89701
                         dados_locais.append({
                             "Arquivo": arquivo_pdf.name, "Tipo NAI": "89701",
                             "Data": m1.group(1), "Nº NF": m1.group(2), "Chave da NF-e": m1.group(3),
@@ -75,7 +101,8 @@ def extrair_linhas_fiscal(arquivo_pdf):
                             "VR DIFAL": converter_para_numero(m1.group(10)), "OBS": ""
                         })
                         estatisticas["Sucesso"] += 1
-                    elif m2:
+                        
+                    elif m2: # 3º Teste: Formato 92284
                         dados_locais.append({
                             "Arquivo": arquivo_pdf.name, "Tipo NAI": "92284",
                             "Data": m2.group(1), "Nº NF": m2.group(2), "Chave da NF-e": m2.group(3),
@@ -89,7 +116,8 @@ def extrair_linhas_fiscal(arquivo_pdf):
                             "OBS": m2.group(13).strip()
                         })
                         estatisticas["Sucesso"] += 1
-                    else:
+                        
+                    else: # Se não for nenhum dos 3, regista como falha para auditar
                         estatisticas["Falhas"] += 1
                         estatisticas["Linhas com Erro"].append(linha)
                         
@@ -98,9 +126,8 @@ def extrair_linhas_fiscal(arquivo_pdf):
 # ==================== FORMATAÇÃO EXCEL VISUAL ====================
 def gerar_excel_formatado_em_memoria(df, tipo, modo_abas):
     wb = openpyxl.Workbook()
-    wb.remove(wb.active) # Remove a aba vazia padrão inicial
+    wb.remove(wb.active) # Remove a aba vazia inicial
 
-    # Estilos de formatação
     header_font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="002060", end_color="002060", fill_type="solid")
     data_font = Font(name="Arial", size=10)
@@ -109,13 +136,10 @@ def gerar_excel_formatado_em_memoria(df, tipo, modo_abas):
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     colunas_moeda = ["Valor NF", "BC ICMS", "ICMS", "% Interna", "ICMS Origem", "VR DIFAL", "Total", "Valor"]
 
-    # Função interna para não repetir código ao formatar as abas
     def preencher_e_formatar_aba(ws, df_aba, nome_aba):
-        # Excel não aceita abas com mais de 31 caracteres ou com certos símbolos especiais
         nome_seguro = re.sub(r'[\\/*?:\[\]]', '', nome_aba)[:31]
         ws.title = nome_seguro
 
-        # Escrever Cabeçalho
         headers = list(df_aba.columns)
         ws.append(headers)
         for col_idx, cell in enumerate(ws[1], 1):
@@ -125,7 +149,6 @@ def gerar_excel_formatado_em_memoria(df, tipo, modo_abas):
             cell.border = border
         ws.row_dimensions[1].height = 30
 
-        # Escrever Dados
         for row_idx, row_data in enumerate(df_aba.itertuples(index=False), 2):
             ws.append(list(row_data))
             fill = alt_fill if row_idx % 2 == 0 else None
@@ -143,7 +166,6 @@ def gerar_excel_formatado_em_memoria(df, tipo, modo_abas):
                         cell.alignment = Alignment(horizontal="right", vertical="center")
                     except: pass
 
-        # Larguras das colunas
         if tipo == "fiscal":
             col_widths = [20, 10, 12, 10, 48, 35, 5, 10, 45, 7, 14, 14, 14, 12, 14, 14, 15]
         else:
@@ -156,29 +178,24 @@ def gerar_excel_formatado_em_memoria(df, tipo, modo_abas):
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
 
-    # ---------------- Lógica de criação de abas ----------------
     if modo_abas == "unica":
-        # Cria apenas uma aba com tudo
         ws_unica = wb.create_sheet("Extração Completa")
         preencher_e_formatar_aba(ws_unica, df, "Extração Completa")
     else:
-        # Cria uma aba para cada ficheiro PDF único encontrado no DataFrame
         arquivos_unicos = df['Arquivo'].unique()
         for arquivo in arquivos_unicos:
             ws_nova = wb.create_sheet()
             df_filtrado = df[df['Arquivo'] == arquivo]
-            # Usa o nome do ficheiro (sem o '.pdf' para poupar espaço) como título
             titulo_aba = arquivo.replace(".pdf", "").replace(".PDF", "")
             preencher_e_formatar_aba(ws_nova, df_filtrado, titulo_aba)
 
-    # Guardar em buffer
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
     return buffer
 
 # ==================== INTERFACE STREAMLIT ====================
-st.set_page_config(page_title="Extrator de Relatórios - Apoena", page_icon="📊")
+st.set_page_config(page_title="Extrator de Relatórios - Apoena", page_icon="📊", layout="wide")
 st.title("📊 Extrator de Relatórios - Apoena")
 
 st.markdown("### 1. O que deseja extrair?")
@@ -240,7 +257,6 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
         if dados_finais:
             df = pd.DataFrame(dados_finais, columns=COLUNAS_CONFIG[tipo_selecionado])
             
-            # Passa a escolha do utilizador ('unica' ou 'separadas') para a função geradora
             buffer_excel = gerar_excel_formatado_em_memoria(df, tipo_selecionado, modo_abas)
             
             st.download_button(
