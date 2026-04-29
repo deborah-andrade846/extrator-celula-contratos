@@ -2,7 +2,7 @@
 """
 Criado em Mon Apr  6 11:22:01 2026
 @author: deborah.goncalves
-Atualizado: extração fiscal com validação de UF para formato A
+Atualizado: extração fiscal com tolerância a lacunas no formato A
 """
 
 import streamlit as st
@@ -58,7 +58,8 @@ def limpar_linha_hotel(linha, nome_hospede):
 
 def _extrair_formato_a(arquivo_pdf):
     """
-    Formato A (com fornecedor). Usa lista de UFs válidas para localizar a UF.
+    Formato A (com fornecedor). Robusto a lacunas: se não encontrar UF,
+    preenche fornecedor com todo o texto até o bloco de valores.
     """
     dados = []
     total_fiscais = 0
@@ -73,6 +74,7 @@ def _extrair_formato_a(arquivo_pdf):
                 if not linha or linha.startswith(('Data','TOTAIS','Página','ANEXO')):
                     continue
 
+                # Pré‑filtro: data + NF + chave de 44 dígitos
                 inicio = re.match(r'(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.+)', linha)
                 if not inicio:
                     continue
@@ -83,8 +85,8 @@ def _extrair_formato_a(arquivo_pdf):
                 chave = inicio.group(3)
                 restante = inicio.group(4).strip()
 
+                # Tenta localizar a UF (última palavra válida)
                 tokens = restante.split()
-                # Encontra a última palavra que seja uma UF válida
                 uf = None
                 idx_uf = -1
                 for i in range(len(tokens)-1, -1, -1):
@@ -92,14 +94,17 @@ def _extrair_formato_a(arquivo_pdf):
                         uf = tokens[i]
                         idx_uf = i
                         break
-                if uf is None:
-                    nao_capturadas += 1
-                    continue
 
-                fornecedor = ' '.join(tokens[:idx_uf]).strip()
-                after_uf = ' '.join(tokens[idx_uf+1:])
+                if uf:
+                    fornecedor = ' '.join(tokens[:idx_uf]).strip()
+                    after_uf = ' '.join(tokens[idx_uf+1:])
+                else:
+                    # Se não achou UF, assume que tudo após a chave é descrição + valores
+                    fornecedor = ""
+                    after_uf = restante
 
-                # Bloco final: CFOP + 3 valores
+                # Procura o bloco CFOP + 3 valores (o último da linha)
+                # Aceita qualquer separador (espaços, tabs) e captura números com ponto ou vírgula
                 m_valores = re.search(
                     r'(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$',
                     after_uf
@@ -119,7 +124,7 @@ def _extrair_formato_a(arquivo_pdf):
                     'numero_nf': nf,
                     'chave_nfe': chave,
                     'fornecedor': fornecedor,
-                    'uf': uf,
+                    'uf': uf if uf else "",
                     'ncm': None,
                     'descricao': descricao,
                     'cfop': cfop,
