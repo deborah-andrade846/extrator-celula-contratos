@@ -11,12 +11,15 @@ import pandas as pd
 import re
 import io
 
-# 1. Configuração das colunas de saída (padronizadas)
+# 1. Configuração das colunas de saída (padronizadas e unificadas)
 COLUNAS_CONFIG = {
     "hotel": ["Arquivo", "Data", "Informação adicional", "Qtde", "Unidade", "Total"],
     "exames": ["Arquivo", "Exame", "Valor"],
     "refeicoes": ["Arquivo", "Data", "Total"],
-    "notas_fiscais": ["Data", "NF", "Chave_NFe", "Fornecedor", "UF", "Descricao", "CFOP", "NCM", "Valor_Itens", "BC_ICMS", "ICMS_Origem", "VR_DIFAL", "OBS"]
+    "notas_fiscais": ["Arquivo_Origem", "Layout_Detectado", "Data", "NF", "Chave_NFe", 
+                      "Fornecedor", "UF", "NCM", "Descricao", "CFOP", 
+                      "Valor_Itens", "BC_ICMS", "ICMS_Origem", "VR_DIFAL", 
+                      "Pct_Interna", "OBS", "Pagina"]
 }
 
 # 2. Lista de UFs brasileiras
@@ -46,6 +49,7 @@ MAPA_COLUNAS = {
     'NUMERO NF': 'NF',
     'NR NF': 'NF',
     'NOTA FISCAL': 'NF',
+    'N FISCAL': 'NF',
     
     # Chave NFe
     'CHAVE DA NOTA FISCAL ELETRÔNICA': 'Chave_NFe',
@@ -134,7 +138,7 @@ MAPA_COLUNAS = {
     'OBSERVACOES': 'OBS',
     'COMPLEMENTO': 'OBS',
     
-    # % Interna (pode ser ignorada ou armazenada)
+    # % Interna
     '% INTERNA': 'Pct_Interna',
     'ALÍQUOTA INTERNA': 'Pct_Interna',
     'ALIQUOTA INTERNA': 'Pct_Interna',
@@ -146,11 +150,9 @@ MAPA_COLUNAS = {
 def normalizar_nome_coluna(nome):
     """Converte nome de coluna para o nome padronizado"""
     nome_upper = nome.upper().strip()
-    
-    # Remover caracteres especiais e espaços extras
     nome_upper = re.sub(r'\s+', ' ', nome_upper)
     
-    # Buscar no mapeamento
+    # Busca exata
     if nome_upper in MAPA_COLUNAS:
         return MAPA_COLUNAS[nome_upper]
     
@@ -159,51 +161,38 @@ def normalizar_nome_coluna(nome):
         if chave in nome_upper or nome_upper in chave:
             return valor
     
-    # Se não encontrou, retorna o nome original
     return nome
 
 
 def mapear_cabecalho(cabecalho):
-    """
-    Recebe a linha de cabeçalho e retorna um dicionário:
-    {indice_coluna: nome_padronizado}
-    """
+    """Mapeia índices das colunas para nomes padronizados"""
     mapeamento = {}
-    
     for idx, coluna in enumerate(cabecalho):
         if coluna and str(coluna).strip():
             nome_original = str(coluna).strip()
             nome_padronizado = normalizar_nome_coluna(nome_original)
             mapeamento[idx] = nome_padronizado
-    
     return mapeamento
 
 
 def limpar_valor(valor_str):
-    """Converte string de valor para float de forma robusta"""
+    """Converte string de valor para float"""
     if not valor_str:
         return 0.0
     
     valor_str = str(valor_str).strip()
     
-    # Se já é número, retorna
     try:
         return float(valor_str)
     except ValueError:
         pass
     
-    # Remove caracteres não numéricos (exceto vírgula e ponto)
     valor_limpo = re.sub(r'[^\d.,\-]', '', valor_str)
-    
     if not valor_limpo:
         return 0.0
     
-    # Detecta formato brasileiro (vírgula como decimal)
     if ',' in valor_limpo:
-        # Remove pontos de milhar
-        valor_limpo = valor_limpo.replace('.', '')
-        # Substitui vírgula por ponto
-        valor_limpo = valor_limpo.replace(',', '.')
+        valor_limpo = valor_limpo.replace('.', '').replace(',', '.')
     
     try:
         return float(valor_limpo)
@@ -211,32 +200,53 @@ def limpar_valor(valor_str):
         return 0.0
 
 
-def extrair_notas_fiscais_universal(arquivo_pdf):
+def identificar_layout(cabecalho_linha):
     """
-    Extrator UNIVERSAL de notas fiscais.
-    Detecta automaticamente a estrutura do cabeçalho e se adapta.
+    Identifica qual layout está sendo usado baseado nas colunas do cabeçalho.
+    Retorna: 'layout_fornecedor_uf', 'layout_uf_ncm', ou 'layout_desconhecido'
+    """
+    linha_str = ' '.join([str(c) if c else '' for c in cabecalho_linha]).upper()
+    colunas_str = [str(c).upper().strip() if c else '' for c in cabecalho_linha]
+    
+    # Layout 1: Data | NF | Chave | Fornecedor | UF | Descricao | CFOP | Valor | ICMS | DIFAL
+    if any('FORNECEDOR' in c for c in colunas_str):
+        return 'Layout 1 - Fornecedor + UF'
+    
+    # Layout 2: DATA | N. FISCAL | Chave | UF | NCM | CFOP | Descricao | VALOR NF | BC ICMS | ICMS | % INTERNA | DIFAL | OBS
+    if any('NCM' in c for c in colunas_str) and any('BC ICMS' in c for c in colunas_str):
+        return 'Layout 2 - UF + NCM + BC ICMS'
+    
+    # Layout 2 alternativo
+    if '% INTERNA' in linha_str or 'ALIQUOTA INTERNA' in linha_str:
+        return 'Layout 2 - UF + NCM + % Interna'
+    
+    return 'Layout Automático'
+
+
+def extrair_notas_fiscais_universal(arquivo_pdf, nome_arquivo):
+    """
+    Extrator UNIVERSAL - processa QUALQUER layout de notas fiscais
+    e consolida em um único formato de saída.
     """
     
     dados_extraidos = []
     metricas = {
+        'nome_arquivo': nome_arquivo,
         'total_paginas': 0,
         'paginas_com_tabela': 0,
         'total_linhas_extraidas': 0,
         'nf_unicas': set(),
-        'colunas_detectadas': [],
+        'layouts_detectados': set(),
         'valor_total_itens': 0.0,
         'valor_total_difal': 0.0,
         'erros': [],
-        'layout_detectado': ''
+        'colunas_detectadas_por_layout': {}
     }
     
     with pdfplumber.open(arquivo_pdf) as pdf:
         metricas['total_paginas'] = len(pdf.pages)
         
-        mapeamento_colunas = None  # Será definido na primeira tabela encontrada
-        
         for num_pagina, pagina in enumerate(pdf.pages):
-            # Extrair tabelas da página
             tabelas = pagina.extract_tables()
             
             if not tabelas:
@@ -246,59 +256,43 @@ def extrair_notas_fiscais_universal(arquivo_pdf):
                 if not tabela or len(tabela) < 2:
                     continue
                 
-                # Se ainda não temos mapeamento, procurar cabeçalho
-                if mapeamento_colunas is None:
-                    for i, linha in enumerate(tabela):
-                        if not linha or not any(linha):
-                            continue
-                        
-                        # Verificar se esta linha parece um cabeçalho
-                        linha_str = ' '.join([str(c) if c else '' for c in linha])
-                        
-                        # Verificar múltiplos padrões de cabeçalho
-                        padroes_cabecalho = [
-                            ['Data', 'Fornecedor', 'CFOP'],           # Layout 1
-                            ['DATA', 'FORNECEDOR', 'CFOP'],           # Layout 1 (caps)
-                            ['DATA', 'N. FISCAL', 'CHAVE'],           # Layout 2
-                            ['DATA', 'NF', 'UF', 'CFOP'],             # Layout 3
-                            ['DATA', 'CFOP', 'DESCRIÇÃO'],            # Layout 4
-                            ['DATA', 'CFOP', 'DESCRICAO'],            # Layout 4 (sem acento)
-                        ]
-                        
-                        for padrao in padroes_cabecalho:
-                            if all(p in linha_str.upper() for p in [x.upper() for x in padrao]):
-                                # Encontramos o cabeçalho!
-                                mapeamento_colunas = mapear_cabecalho(linha)
-                                metricas['colunas_detectadas'] = list(mapeamento_colunas.values())
-                                
-                                # Identificar layout
-                                cols_detectadas = set(mapeamento_colunas.values())
-                                if 'Fornecedor' in cols_detectadas and 'UF' in cols_detectadas:
-                                    metricas['layout_detectado'] = 'Layout Padrão (Fornecedor + UF)'
-                                elif 'UF' in cols_detectadas and 'NCM' in cols_detectadas:
-                                    metricas['layout_detectado'] = 'Layout Alternativo (UF + NCM)'
-                                else:
-                                    metricas['layout_detectado'] = 'Layout Automático'
-                                
-                                break
-                        
-                        if mapeamento_colunas is not None:
+                cabecalho_idx = -1
+                layout_detectado = None
+                mapeamento_colunas = None
+                
+                # Procurar cabeçalho em cada tabela (pode haver múltiplas por página)
+                for i, linha in enumerate(tabela):
+                    if not linha or not any(linha):
+                        continue
+                    
+                    linha_str = ' '.join([str(c) if c else '' for c in linha]).upper()
+                    
+                    # Verificar se é cabeçalho (múltiplos padrões)
+                    padroes = [
+                        ['DATA', 'FORNECEDOR', 'CFOP'],
+                        ['DATA', 'N. FISCAL', 'CHAVE'],
+                        ['DATA', 'NF', 'UF', 'CFOP'],
+                        ['DATA', 'CFOP', 'DESCRI'],
+                        ['DATA', 'NCM', 'CFOP'],
+                    ]
+                    
+                    for padrao in padroes:
+                        if all(p in linha_str for p in padrao):
                             cabecalho_idx = i
+                            mapeamento_colunas = mapear_cabecalho(linha)
+                            layout_detectado = identificar_layout(linha)
+                            metricas['layouts_detectados'].add(layout_detectado)
+                            
+                            # Registrar colunas por layout
+                            if layout_detectado not in metricas['colunas_detectadas_por_layout']:
+                                metricas['colunas_detectadas_por_layout'][layout_detectado] = list(mapeamento_colunas.values())
                             break
                     
-                    if mapeamento_colunas is None:
-                        continue
-                else:
-                    # Procurar cabeçalho novamente (pode mudar entre páginas)
-                    for i, linha in enumerate(tabela):
-                        if not linha or not any(linha):
-                            continue
-                        linha_str = ' '.join([str(c) if c else '' for c in linha])
-                        if all(p in linha_str.upper() for p in ['DATA', 'CFOP']):
-                            cabecalho_idx = i
-                            break
-                    else:
-                        continue
+                    if cabecalho_idx >= 0:
+                        break
+                
+                if cabecalho_idx < 0:
+                    continue
                 
                 metricas['paginas_com_tabela'] += 1
                 
@@ -307,7 +301,6 @@ def extrair_notas_fiscais_universal(arquivo_pdf):
                     if not linha or not any(linha):
                         continue
                     
-                    # Limpar células
                     celulas = [str(c).strip() if c else '' for c in linha]
                     
                     # Pular totais
@@ -315,43 +308,36 @@ def extrair_notas_fiscais_universal(arquivo_pdf):
                     if any(p in linha_completa for p in ['TOTAL DO MÊS', 'TOTAIS DO MÊS', 'TOTAL GERAL', 'TOTAIS']):
                         continue
                     
-                    # Construir dicionário de dados com base no mapeamento
-                    item = {}
+                    # Construir item com base no mapeamento
+                    item = {
+                        'Arquivo_Origem': nome_arquivo,
+                        'Layout_Detectado': layout_detectado,
+                        'Pagina': num_pagina + 1
+                    }
                     
                     for idx_col, nome_padronizado in mapeamento_colunas.items():
                         if idx_col < len(celulas):
-                            valor_celula = celulas[idx_col]
-                        else:
-                            valor_celula = ''
-                        
-                        # Armazenar no campo padronizado
-                        if nome_padronizado not in item:
-                            item[nome_padronizado] = valor_celula
+                            item[nome_padronizado] = celulas[idx_col]
                     
-                    # Validar campos essenciais
-                    data = item.get('Data', '')
-                    nf = item.get('NF', '')
-                    
-                    # Se não tem NF, tentar extrair de Chave_NFe (posições 25-34)
-                    if (not nf or not nf.isdigit()) and item.get('Chave_NFe', ''):
-                        chave = item.get('Chave_NFe', '')
+                    # Extrair NF da chave se necessário
+                    if (not item.get('NF') or not str(item.get('NF', '')).isdigit()) and item.get('Chave_NFe', ''):
+                        chave = str(item.get('Chave_NFe', ''))
                         if len(chave) >= 34:
-                            nf = chave[25:34]
-                            item['NF'] = nf
+                            item['NF'] = chave[25:34]
                     
                     # Validar data
+                    data = str(item.get('Data', ''))
                     if not re.match(r'\d{2}/\d{2}/\d{4}', data):
-                        # Tentar encontrar data em outras colunas
                         for v in item.values():
                             if re.match(r'\d{2}/\d{2}/\d{4}', str(v)):
-                                data = str(v)
-                                item['Data'] = data
+                                item['Data'] = str(v)
                                 break
                         else:
                             continue
                     
                     # Validar NF
-                    if not nf or not re.match(r'^\d+$', str(nf)):
+                    nf = str(item.get('NF', ''))
+                    if not nf or not re.match(r'^\d+$', nf):
                         continue
                     
                     # Converter valores numéricos
@@ -360,7 +346,7 @@ def extrair_notas_fiscais_universal(arquivo_pdf):
                         if campo in item:
                             item[campo] = limpar_valor(item[campo])
                     
-                    # Garantir campos essenciais
+                    # Garantir todos os campos
                     item.setdefault('Fornecedor', '')
                     item.setdefault('UF', '')
                     item.setdefault('Descricao', '')
@@ -372,199 +358,292 @@ def extrair_notas_fiscais_universal(arquivo_pdf):
                     item.setdefault('BC_ICMS', 0.0)
                     item.setdefault('ICMS_Origem', 0.0)
                     item.setdefault('VR_DIFAL', 0.0)
+                    item.setdefault('Pct_Interna', 0.0)
                     
-                    # Validar UF (se presente)
+                    # Limpar UF
                     uf = str(item.get('UF', '')).strip().upper()
                     if uf and len(uf) > 2:
-                        # UF pode estar misturada - extrair apenas 2 letras
                         match_uf = re.search(r'([A-Z]{2})', uf)
-                        if match_uf:
-                            item['UF'] = match_uf.group(1)
-                        else:
-                            item['UF'] = uf[:2]
+                        item['UF'] = match_uf.group(1) if match_uf else uf[:2]
+                    
+                    # Limpar fornecedor
+                    if item.get('Fornecedor'):
+                        item['Fornecedor'] = re.sub(r'\s+', ' ', str(item['Fornecedor'])).strip()
+                    
+                    # Limpar descrição
+                    if item.get('Descricao'):
+                        item['Descricao'] = re.sub(r'\s+', ' ', str(item['Descricao'])).strip()
                     
                     # Atualizar métricas
-                    metricas['nf_unicas'].add(str(nf))
-                    if len(data) >= 10:
-                        mes = data[3:5] + '/' + data[6:10]
-                        if not hasattr(metricas, 'meses_encontrados'):
-                            metricas['meses_encontrados'] = set()
-                        metricas['meses_encontrados'].add(mes)
-                    
+                    metricas['nf_unicas'].add(nf)
                     metricas['valor_total_itens'] += item.get('Valor_Itens', 0)
                     metricas['valor_total_difal'] += item.get('VR_DIFAL', 0)
                     metricas['total_linhas_extraidas'] += 1
                     
-                    # Adicionar à lista final
                     dados_extraidos.append(item)
     
-    # Finalizar métricas
     metricas['nf_unicas_count'] = len(metricas['nf_unicas'])
-    if hasattr(metricas, 'meses_encontrados') and metricas.get('meses_encontrados'):
-        metricas['meses_encontrados'] = sorted(list(metricas['meses_encontrados']))
-        metricas['meses_count'] = len(metricas['meses_encontrados'])
-    else:
-        metricas['meses_encontrados'] = []
-        metricas['meses_count'] = 0
+    metricas['layouts_detectados'] = list(metricas['layouts_detectados'])
     
     return dados_extraidos, metricas
 
 
 # ============ INTERFACE STREAMLIT ============
 
-st.set_page_config(page_title="Extrator de Relatórios - Apoena", page_icon="📊", layout="wide")
-st.title("📊 Extrator de Relatórios - Apoena")
+st.set_page_config(page_title="Extrator de Notas Fiscais - Apoena", page_icon="📊", layout="wide")
+st.title("📊 Extrator Universal de Notas Fiscais")
+st.markdown("### Consolida automaticamente múltiplos layouts em um único arquivo")
 
 with st.sidebar:
     st.markdown("## ⚙️ Configurações")
     st.markdown("---")
-    mostrar_metricas = st.checkbox("📈 Painel de auditoria", value=True)
+    mostrar_metricas = st.checkbox("📈 Painel de auditoria consolidado", value=True)
     mostrar_preview = st.checkbox("👁️ Preview dos dados", value=True)
-    mostrar_erros = st.checkbox("🔍 Mostrar erros de extração", value=False)
-    mostrar_diagnostico = st.checkbox("🔬 Diagnóstico do layout detectado", value=True)
+    mostrar_diagnostico = st.checkbox("🔬 Diagnóstico por arquivo", value=True)
 
-st.markdown("### 1. Tipo de relatório:")
-tipo_selecionado = st.radio(
-    "Escolha:",
-    options=["notas_fiscais", "hotel", "exames", "refeicoes"],
-    format_func=lambda x: {
-        "notas_fiscais": "📋 Notas Fiscais (Detecção Automática de Layout)",
-        "hotel": "🏨 Diárias e Consumo (Plaza Hotel)",
-        "exames": "🩺 Exames Ocupacionais (Biomed)",
-        "refeicoes": "🍽️ Mapa de Refeições"
-    }[x],
-    horizontal=True
-)
+st.markdown("### 📁 Selecione os ficheiros PDF:")
+st.caption("Arraste PDFs de qualquer layout - o sistema detecta automaticamente e consolida tudo.")
 
-st.markdown("### 2. Selecione os ficheiros PDF:")
 arquivos_selecionados = st.file_uploader(
-    "Arraste e solte ou clique", 
+    "Formatos aceitos: Layout 1 (Fornecedor+UF) e Layout 2 (UF+NCM+BC ICMS)",
     type=['pdf'], 
     accept_multiple_files=True,
-    help="Aceita qualquer layout de notas fiscais (detecção automática)"
+    help="Processa simultaneamente PDFs de diferentes layouts"
 )
 
-if st.button("🚀 Extrair Dados e Gerar Excel", type="primary", use_container_width=True):
+if arquivos_selecionados:
+    st.info(f"📂 **{len(arquivos_selecionados)} arquivo(s) selecionado(s)**")
+    
+    # Mostrar nomes dos arquivos
+    with st.expander("📋 Ver arquivos selecionados"):
+        for i, arq in enumerate(arquivos_selecionados):
+            st.write(f"{i+1}. {arq.name} ({arq.size/1024:.1f} KB)")
+
+if st.button("🚀 Extrair e Consolidar Tudo em Excel Único", type="primary", use_container_width=True):
     if not arquivos_selecionados:
         st.warning("⚠️ Selecione pelo menos um ficheiro PDF.")
     else:
         todos_dados = []
-        metricas_consolidadas = {}
+        metricas_por_arquivo = []
+        total_geral = {
+            'total_arquivos': len(arquivos_selecionados),
+            'total_linhas': 0,
+            'total_nfs_unicas': set(),
+            'total_valor_itens': 0.0,
+            'total_difal': 0.0,
+            'layouts_encontrados': set(),
+            'arquivos_com_erro': 0
+        }
         
         import time
         inicio = time.time()
         
+        # Barra de progresso principal
         progress_bar = st.progress(0)
         status_text = st.empty()
         
+        # Container para diagnósticos
+        diag_container = st.container()
+        
         for idx, arquivo_pdf in enumerate(arquivos_selecionados):
             nome_arquivo = arquivo_pdf.name
-            status_text.text(f"Processando: {nome_arquivo} ({idx+1}/{len(arquivos_selecionados)})")
+            status_text.text(f"🔄 Processando {idx+1}/{len(arquivos_selecionados)}: {nome_arquivo}")
             
-            if tipo_selecionado == "notas_fiscais":
-                dados, metricas = extrair_notas_fiscais_universal(arquivo_pdf)
-                metricas['nome_arquivo'] = nome_arquivo
+            try:
+                dados, metricas = extrair_notas_fiscais_universal(arquivo_pdf, nome_arquivo)
                 
                 todos_dados.extend(dados)
-                metricas_consolidadas = metricas
+                metricas_por_arquivo.append(metricas)
                 
-                # Mostrar diagnóstico do layout
-                if mostrar_diagnostico and metricas.get('colunas_detectadas'):
-                    st.info(f"""
-                    **📋 Arquivo: {nome_arquivo}**
-                    - **Layout detectado:** {metricas.get('layout_detectado', 'Automático')}
-                    - **Colunas encontradas:** {', '.join(metricas.get('colunas_detectadas', []))}
-                    - **Linhas extraídas:** {metricas.get('total_linhas_extraidas', 0)}
-                    """)
+                # Atualizar totais gerais
+                total_geral['total_linhas'] += metricas['total_linhas_extraidas']
+                total_geral['total_nfs_unicas'].update(metricas['nf_unicas'])
+                total_geral['total_valor_itens'] += metricas['valor_total_itens']
+                total_geral['total_difal'] += metricas['valor_total_difal']
+                total_geral['layouts_encontrados'].update(metricas['layouts_detectados'])
+                
+                # Diagnóstico individual
+                if mostrar_diagnostico:
+                    with diag_container:
+                        with st.expander(f"📄 {nome_arquivo}", expanded=(len(arquivos_selecionados) <= 3)):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Linhas extraídas", metricas['total_linhas_extraidas'])
+                            with col2:
+                                st.metric("NFs únicas", metricas['nf_unicas_count'])
+                            with col3:
+                                st.metric("Layout detectado", metricas['layouts_detectados'][0] if metricas['layouts_detectados'] else 'N/A')
+                            
+                            if metricas.get('colunas_detectadas_por_layout'):
+                                for layout, colunas in metricas['colunas_detectadas_por_layout'].items():
+                                    st.caption(f"**Colunas ({layout}):** {', '.join(colunas)}")
+                
+            except Exception as e:
+                total_geral['arquivos_com_erro'] += 1
+                st.error(f"❌ Erro ao processar {nome_arquivo}: {str(e)}")
             
             progress_bar.progress((idx + 1) / len(arquivos_selecionados))
         
         tempo_total = round(time.time() - inicio, 2)
         status_text.text("✅ Processamento concluído!")
         
-        # ============ RESULTADOS ============
+        # ============ RESULTADO FINAL CONSOLIDADO ============
         if todos_dados:
-            # Criar DataFrame com todas as colunas possíveis
+            st.markdown("---")
+            st.markdown("## ✅ Extração Concluída - Consolidado Único")
+            
+            # Criar DataFrame unificado
             colunas_saida = COLUNAS_CONFIG['notas_fiscais']
             df = pd.DataFrame(todos_dados)
             
-            # Garantir que todas as colunas de saída existam
+            # Garantir colunas
             for col in colunas_saida:
                 if col not in df.columns:
                     df[col] = ''
             
             df = df[colunas_saida]
             
-            # ===== MÉTRICAS =====
-            if mostrar_metricas and metricas_consolidadas:
-                st.markdown("---")
-                st.markdown("## 📊 Painel de Auditoria")
+            # ===== PAINEL CONSOLIDADO =====
+            if mostrar_metricas:
+                st.markdown("### 📊 Painel Consolidado")
                 
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("📄 Páginas", metricas_consolidadas.get('total_paginas', 'N/A'))
+                    st.metric("📁 Arquivos Processados", 
+                             f"{total_geral['total_arquivos'] - total_geral['arquivos_com_erro']}/{total_geral['total_arquivos']}")
                 with col2:
-                    st.metric("🧾 NFs Únicas", metricas_consolidadas.get('nf_unicas_count', 0))
+                    st.metric("📝 Total de Linhas", total_geral['total_linhas'])
                 with col3:
-                    st.metric("📝 Linhas Extraídas", len(todos_dados))
+                    st.metric("🧾 Total NFs Únicas", len(total_geral['total_nfs_unicas']))
                 with col4:
-                    st.metric("⏱️ Tempo", f"{tempo_total}s")
+                    st.metric("⏱️ Tempo Total", f"{tempo_total}s")
                 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("💰 Valor Total Itens", f"R$ {metricas_consolidadas.get('valor_total_itens', 0):,.2f}")
+                    st.metric("💰 Valor Total Itens", f"R$ {total_geral['total_valor_itens']:,.2f}")
                 with col2:
-                    st.metric("💵 Total DIFAL", f"R$ {metricas_consolidadas.get('valor_total_difal', 0):,.2f}")
+                    st.metric("💵 Total DIFAL", f"R$ {total_geral['total_difal']:,.2f}")
                 with col3:
-                    st.metric("🔍 Layout", metricas_consolidadas.get('layout_detectado', 'N/A'))
+                    layouts_str = ', '.join(total_geral['layouts_encontrados'])
+                    st.metric("🔍 Layouts Detectados", layouts_str if layouts_str else 'N/A')
                 
-                if metricas_consolidadas.get('meses_encontrados'):
-                    st.markdown(f"**📅 Período:** {' | '.join(metricas_consolidadas['meses_encontrados'])}")
+                # Distribuição por layout
+                if 'Layout_Detectado' in df.columns and len(df['Layout_Detectado'].unique()) > 1:
+                    st.markdown("#### Distribuição por Layout")
+                    layout_counts = df['Layout_Detectado'].value_counts()
+                    
+                    cols = st.columns(len(layout_counts))
+                    for i, (layout, count) in enumerate(layout_counts.items()):
+                        with cols[i]:
+                            st.metric(layout, f"{count} linhas")
+                
+                # Distribuição por arquivo
+                st.markdown("#### Distribuição por Arquivo")
+                df_por_arquivo = df.groupby('Arquivo_Origem').agg(
+                    Linhas=('NF', 'count'),
+                    NFs_Unicas=('NF', 'nunique'),
+                    Valor_Itens=('Valor_Itens', 'sum'),
+                    DIFAL=('VR_DIFAL', 'sum')
+                ).reset_index()
+                
+                st.dataframe(df_por_arquivo, use_container_width=True)
             
             # ===== PREVIEW =====
             if mostrar_preview:
                 st.markdown("---")
-                st.markdown("## 👁️ Preview dos Dados Extraídos")
+                st.markdown("### 👁️ Preview do Consolidado")
                 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**Primeiros 5 registros:**")
-                    st.dataframe(df.head(), use_container_width=True)
-                with col2:
-                    st.markdown("**Últimos 5 registros:**")
-                    st.dataframe(df.tail(), use_container_width=True)
+                tab1, tab2, tab3 = st.tabs(["📋 Primeiros Registros", "📋 Últimos Registros", "🔍 Por Layout"])
+                
+                with tab1:
+                    st.dataframe(df.head(10), use_container_width=True)
+                
+                with tab2:
+                    st.dataframe(df.tail(10), use_container_width=True)
+                
+                with tab3:
+                    if 'Layout_Detectado' in df.columns and len(df['Layout_Detectado'].unique()) > 1:
+                        layout_selecionado = st.selectbox("Selecione o layout:", df['Layout_Detectado'].unique())
+                        df_layout = df[df['Layout_Detectado'] == layout_selecionado]
+                        st.dataframe(df_layout.head(10), use_container_width=True)
+                        st.caption(f"Total de linhas neste layout: {len(df_layout)}")
             
-            # ===== DOWNLOAD =====
+            # ===== DOWNLOAD CONSOLIDADO =====
             st.markdown("---")
+            st.markdown("### 📥 Download do Arquivo Consolidado")
             
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name='Dados Extraídos')
+                # Aba principal: todos os dados
+                df.to_excel(writer, index=False, sheet_name='Consolidado')
                 
-                # Aba de métricas
-                if metricas_consolidadas:
-                    dados_met = [
-                        ['Arquivo', metricas_consolidadas.get('nome_arquivo', 'N/A')],
-                        ['Layout Detectado', metricas_consolidadas.get('layout_detectado', 'N/A')],
-                        ['Colunas Encontradas', ', '.join(metricas_consolidadas.get('colunas_detectadas', []))],
-                        ['Páginas', metricas_consolidadas.get('total_paginas', 0)],
-                        ['Linhas Extraídas', len(todos_dados)],
-                        ['NFs Únicas', metricas_consolidadas.get('nf_unicas_count', 0)],
-                        ['Valor Total Itens (R$)', metricas_consolidadas.get('valor_total_itens', 0)],
-                        ['Total DIFAL (R$)', metricas_consolidadas.get('valor_total_difal', 0)],
-                        ['Tempo Processamento (s)', tempo_total],
-                    ]
-                    pd.DataFrame(dados_met, columns=['Métrica', 'Valor']).to_excel(
-                        writer, index=False, sheet_name='Métricas'
-                    )
+                # Aba de métricas consolidadas
+                dados_metricas = [
+                    ['Total de Arquivos Processados', total_geral['total_arquivos']],
+                    ['Arquivos com Erro', total_geral['arquivos_com_erro']],
+                    ['Total de Linhas Extraídas', total_geral['total_linhas']],
+                    ['Total de NFs Únicas', len(total_geral['total_nfs_unicas'])],
+                    ['Valor Total Itens (R$)', f"{total_geral['total_valor_itens']:,.2f}"],
+                    ['Total DIFAL (R$)', f"{total_geral['total_difal']:,.2f}"],
+                    ['Layouts Detectados', ', '.join(total_geral['layouts_encontrados'])],
+                    ['Tempo de Processamento', f"{tempo_total}s"],
+                    ['Data/Hora Extração', time.strftime('%d/%m/%Y %H:%M:%S')],
+                ]
+                pd.DataFrame(dados_metricas, columns=['Métrica', 'Valor']).to_excel(
+                    writer, index=False, sheet_name='Métricas Consolidadas'
+                )
+                
+                # Aba de resumo por arquivo
+                if df_por_arquivo is not None:
+                    df_por_arquivo.to_excel(writer, index=False, sheet_name='Resumo por Arquivo')
+                
+                # Aba de métricas detalhadas por arquivo
+                if metricas_por_arquivo:
+                    detalhes = []
+                    for m in metricas_por_arquivo:
+                        detalhes.append({
+                            'Arquivo': m.get('nome_arquivo', 'N/A'),
+                            'Páginas': m.get('total_paginas', 0),
+                            'Linhas Extraídas': m.get('total_linhas_extraidas', 0),
+                            'NFs Únicas': m.get('nf_unicas_count', 0),
+                            'Valor Itens (R$)': m.get('valor_total_itens', 0),
+                            'DIFAL (R$)': m.get('valor_total_difal', 0),
+                            'Layout': ', '.join(m.get('layouts_detectados', [])),
+                            'Colunas': ', '.join(list(m.get('colunas_detectadas_por_layout', {}).keys())[:1]) if m.get('colunas_detectadas_por_layout') else 'N/A'
+                        })
+                    pd.DataFrame(detalhes).to_excel(writer, index=False, sheet_name='Detalhes por Arquivo')
             
-            st.success(f"✅ {len(todos_dados)} registros extraídos com sucesso!")
+            # Botão de download
+            nfs_count = len(total_geral['total_nfs_unicas'])
+            st.success(f"✅ **{total_geral['total_linhas']} registros** de **{nfs_count} NFs** extraídos e consolidados!")
+            
             st.download_button(
-                label="📥 Baixar Excel Completo",
+                label=f"📥 Baixar Excel Consolidado ({total_geral['total_linhas']} linhas, {nfs_count} NFs)",
                 data=buffer.getvalue(),
-                file_name=f"Extracao_NFs_{metricas_consolidadas.get('nf_unicas_count', 0)}_NFs.xlsx",
+                file_name=f"NFs_Consolidadas_{nfs_count}_NFs_{time.strftime('%Y%m%d_%H%M')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
+            
+            # Informações adicionais
+            with st.expander("📋 Detalhes do Arquivo Gerado"):
+                st.markdown(f"""
+                **Arquivo Excel contém 4 abas:**
+                1. **Consolidado** - Todos os dados unificados ({total_geral['total_linhas']} linhas)
+                2. **Métricas Consolidadas** - Resumo geral da extração
+                3. **Resumo por Arquivo** - Totais por arquivo de origem
+                4. **Detalhes por Arquivo** - Métricas detalhadas de cada PDF
+                
+                **Colunas no consolidado:**
+                - `Arquivo_Origem` - Nome do PDF de origem
+                - `Layout_Detectado` - Qual layout foi identificado
+                - `Data`, `NF`, `Chave_NFe`, `Fornecedor`, `UF`, `NCM`
+                - `Descricao`, `CFOP`, `Valor_Itens`, `BC_ICMS`
+                - `ICMS_Origem`, `VR_DIFAL`, `Pct_Interna`, `OBS`
+                - `Pagina` - Número da página no PDF
+                """)
+        
         else:
-            st.error("❌ Nenhum dado foi extraído. Verifique se o PDF contém tabelas reconhecíveis.")
+            st.error("❌ Nenhum dado foi extraído de nenhum arquivo.")
+            if total_geral['arquivos_com_erro'] > 0:
+                st.warning(f"⚠️ {total_geral['arquivos_com_erro']} arquivo(s) com erro. Verifique as mensagens acima.")
