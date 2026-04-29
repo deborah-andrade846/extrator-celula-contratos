@@ -52,21 +52,13 @@ def limpar_linha_hotel(linha, nome_hospede):
 
 # --- Fiscal (duas estratégias separadas) ---
 def _extrair_formato_a(arquivo_pdf):
-    """Formato A: Data | NF | Chave | Fornecedor | UF | Descrição | CFOP | Valor | ICMS Origem | VR DIFAL"""
+    """
+    Formato com fornecedor (ex.: AnexoSNE89701).
+    Estratégia: após data, NF e chave (44 dígitos), identifica a UF
+    (duas letras maiúsculas) e, em seguida, localiza o bloco CFOP (4 dígitos)
+    seguido de três valores monetários.
+    """
     dados = []
-    padrao = re.compile(
-        r'(\d{2}/\d{2}/\d{4})\s+'
-        r'(\d+)\s+'
-        r'(\d{44})\s+'
-        r'(.+?)\s{2,}'          # fornecedor (até 2+ espaços)
-        r'([A-Z]{2})\s+'
-        r'(.+?)\s+'              # descrição
-        r'(\d{4})\s+'
-        r'([\d.,]+)\s+'          # valor total
-        r'([\d.,]+)\s+'          # ICMS origem
-        r'([\d.,]+)'             # VR DIFAL
-    )
-    
     with pdfplumber.open(arquivo_pdf) as pdf:
         for pagina in pdf.pages:
             texto = pagina.extract_text()
@@ -76,25 +68,60 @@ def _extrair_formato_a(arquivo_pdf):
                 linha = linha.strip()
                 if not linha or linha.startswith(('Data','TOTAIS','Página','ANEXO')):
                     continue
-                m = padrao.search(linha)
-                if m:
-                    dados.append({
-                        'data_emissao': m.group(1),
-                        'numero_nf': m.group(2),
-                        'chave_nfe': m.group(3),
-                        'fornecedor': m.group(4).strip(),
-                        'uf': m.group(5),
-                        'ncm': None,
-                        'descricao': m.group(6).strip(),
-                        'cfop': m.group(7),
-                        'valor_total': m.group(8),
-                        'bc_icms': None,
-                        'icms': None,
-                        'percentual_interna': None,
-                        'icms_origem': m.group(9),
-                        'valor_difal': m.group(10),
-                    })
+
+                # 1. Extrai data, número NF e chave de 44 dígitos
+                match_inicio = re.match(
+                    r'(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.+)', linha
+                )
+                if not match_inicio:
+                    continue
+
+                data = match_inicio.group(1)
+                nf = match_inicio.group(2)
+                chave = match_inicio.group(3)
+                restante = match_inicio.group(4)
+
+                # 2. Localiza a UF – duas letras maiúsculas "soltas"
+                uf_match = re.search(r'\b([A-Z]{2})\b', restante)
+                if not uf_match:
+                    continue
+                uf = uf_match.group(1)
+                fornecedor = restante[:uf_match.start()].strip()
+                after_uf = restante[uf_match.end():].strip()
+
+                # 3. Encontra o CFOP (4 dígitos) seguido dos três valores monetários
+                valores_match = re.search(
+                    r'(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)', after_uf
+                )
+                if not valores_match:
+                    continue
+
+                cfop = valores_match.group(1)
+                valor_total = valores_match.group(2)
+                icms_origem = valores_match.group(3)
+                vr_difal = valores_match.group(4)
+
+                # Descrição é tudo após UF e antes do CFOP
+                descricao = after_uf[:valores_match.start()].strip()
+
+                dados.append({
+                    'data_emissao': data,
+                    'numero_nf': nf,
+                    'chave_nfe': chave,
+                    'fornecedor': fornecedor,
+                    'uf': uf,
+                    'ncm': None,
+                    'descricao': descricao,
+                    'cfop': cfop,
+                    'valor_total': valor_total,
+                    'bc_icms': None,
+                    'icms': None,
+                    'percentual_interna': None,
+                    'icms_origem': icms_origem,
+                    'valor_difal': vr_difal,
+                })
     return dados
+
 
 def _extrair_formato_b(arquivo_pdf):
     """Formato B: Data | NF | Chave | UF | NCM | CFOP | Descrição | Valor NF | BC ICMS | ICMS | % Interna | DIFAL"""
@@ -142,6 +169,7 @@ def _extrair_formato_b(arquivo_pdf):
                         'valor_difal': m.group(12),
                     })
     return dados
+
 
 def extrair_dados_fiscais_pdf(arquivo_pdf):
     """Tenta os dois formatos e retorna o que gerar mais dados."""
