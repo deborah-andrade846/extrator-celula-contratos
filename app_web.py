@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Extrator de Relatórios - Apoena
-Versão Definitiva Nuvem: OCR com OpenCV e Separador Inteligente de Linhas
+Versão Nuvem Definitiva: OCR com Visão Computacional (OpenCV)
 """
 
 import streamlit as st
@@ -21,11 +21,7 @@ COLUNAS_CONFIG = {
     "hotel": ["Arquivo", "Data", "Informação adicional", "Qtde", "Unidade", "Total"],
     "exames": ["Arquivo", "Exame", "Valor"],
     "refeicoes": ["Arquivo", "Data", "Total"],
-    "fiscal": [
-        "Arquivo", "Tipo NAI", "Data", "Nº NF", "Chave da NF-e", "Fornecedor", 
-        "UF", "NCM", "Descrição", "CFOP", "Valor NF", "BC ICMS", "ICMS", 
-        "% Interna", "ICMS Origem", "VR DIFAL", "OBS"
-    ]
+    "fiscal": ["Arquivo", "Tipo NAI", "Data", "Nº NF", "Chave da NF-e", "Fornecedor", "UF", "NCM", "Descrição", "CFOP", "Valor NF", "BC ICMS", "ICMS", "% Interna", "ICMS Origem", "VR DIFAL", "OBS"]
 }
 
 def converter_para_numero(valor_str):
@@ -41,14 +37,7 @@ def limpar_linha_hotel(linha, nome_hospede):
         resto = linha[linha.find(data) + len(data):].strip()
         partes = resto.split()
         if len(partes) >= 7 and "," in partes[-1] and "," in partes[-6]:
-            return {
-                "Arquivo": nome_hospede, 
-                "Data": data, 
-                "Informação adicional": " ".join(partes[1:-6]).replace("|", "-").strip().split(" - Comanda")[0].strip(), 
-                "Qtde": partes[-6], 
-                "Unidade": partes[-5], 
-                "Total": partes[-1]
-            }
+            return {"Arquivo": nome_hospede, "Data": data, "Informação adicional": " ".join(partes[1:-6]).replace("|", "-").strip().split(" - Comanda")[0].strip(), "Qtde": partes[-6], "Unidade": partes[-5], "Total": partes[-1]}
     return None
 
 # ==================== REGEX FISCAL ====================
@@ -65,19 +54,19 @@ def ler_texto_com_ocr(arquivo_pdf):
     with pdfplumber.open(arquivo_pdf) as pdf:
         total_paginas = len(pdf.pages)
         for i, pagina in enumerate(pdf.pages):
-            # Resolução alta (300 DPI)
+            # Resolução alta para captar detalhes de vírgulas e pontos
             img_pil = pagina.to_image(resolution=300).original
             img_cv = np.array(img_pil)
             
             if len(img_cv.shape) == 3 and img_cv.shape[2] == 3:
                 img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
             
-            # Filtros de precisão OpenCV
+            # Filtros de precisão
             img_cinza = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
             img_suave = cv2.GaussianBlur(img_cinza, (3, 3), 0)
             _, img_binarizada = cv2.threshold(img_suave, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
             
-            # Leitura do texto via Tesseract
+            # Leitura do texto
             configuracao_tesseract = '--psm 6 --oem 3'
             texto_pagina = pytesseract.image_to_string(img_binarizada, lang='por', config=configuracao_tesseract)
             texto_completo += texto_pagina + "\n"
@@ -89,7 +78,7 @@ def ler_texto_com_ocr(arquivo_pdf):
     barra_progresso.empty()
     return texto_completo
 
-# ==================== MOTOR DE EXTRAÇÃO FISCAL ====================
+# ==================== MOTOR DE EXTRAÇÃO ====================
 def extrair_linhas_fiscal(arquivo_pdf, usar_ocr):
     dados_locais, linhas_rejeitadas = [], []
     estatisticas = {"Arquivo": arquivo_pdf.name, "Total Fiscais Encontradas": 0, "Sucesso": 0, "Falhas": 0}
@@ -104,18 +93,9 @@ def extrair_linhas_fiscal(arquivo_pdf, usar_ocr):
                 txt = pagina.extract_text(layout=True)
                 if txt: linhas_do_texto.extend(txt.split('\n'))
 
-    # 🚀 Separador Inteligente de Linhas Aglutinadas
-    linhas_corrigidas = []
     for linha in linhas_do_texto:
-        # Força uma quebra de linha sempre que encontra a data de uma nova nota colada noutro texto
-        linha_separada = re.sub(r'(?<!^)(?=\d{2}/\d{2}/\d{4}\s+\d+\s+\d{44})', '\n', linha)
-        linhas_corrigidas.extend(linha_separada.split('\n'))
-
-    # Processamento Final
-    for linha in linhas_corrigidas:
         linha = linha.strip()
         if not linha: continue
-        
         if padrao_linha_fiscal_generica.match(linha):
             estatisticas["Total Fiscais Encontradas"] += 1
             m1, m2, m3 = padrao_89701.match(linha), padrao_92284.match(linha), padrao_misto.match(linha)
@@ -140,50 +120,38 @@ def gerar_excel_formatado_em_memoria(df, df_erros, tipo_relatorio, modo_abas):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     
-    header_font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="002060", end_color="002060", fill_type="solid")
-    data_font = Font(name="Arial", size=10)
-    alt_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+    header_font, header_fill = Font(name="Arial", size=10, bold=True, color="FFFFFF"), PatternFill(start_color="002060", end_color="002060", fill_type="solid")
+    data_font, alt_fill = Font(name="Arial", size=10), PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
     border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
     colunas_moeda = ["Valor NF", "BC ICMS", "ICMS", "% Interna", "ICMS Origem", "VR DIFAL", "Total", "Valor"]
 
     def formatar_aba(ws, df_aba, nome):
         ws.title = re.sub(r'[\\/*?:\[\]]', '', nome)[:31]
         ws.append(list(df_aba.columns))
-        for cell in ws[1]: 
-            cell.font, cell.fill, cell.alignment, cell.border = header_font, header_fill, Alignment(horizontal="center", vertical="center"), border
-        
+        for cell in ws[1]: cell.font, cell.fill, cell.alignment, cell.border = header_font, header_fill, Alignment(horizontal="center", vertical="center"), border
         for r_idx, row in enumerate(df_aba.itertuples(index=False), 2):
             ws.append(list(row))
             for c_idx, cell in enumerate(ws[r_idx], 1):
                 cell.font, cell.alignment, cell.border = data_font, Alignment(vertical="center"), border
                 if r_idx % 2 == 0: cell.fill = alt_fill
                 if list(df_aba.columns)[c_idx-1] in colunas_moeda and cell.value is not None:
-                    try: 
-                        cell.number_format, cell.alignment = "#,##0.00", Alignment(horizontal="right", vertical="center")
+                    try: cell.number_format, cell.alignment = "#,##0.00", Alignment(horizontal="right", vertical="center")
                     except: pass
-                    
         widths = [20, 10, 12, 10, 48, 35, 5, 10, 45, 7, 14, 14, 14, 12, 14, 14, 15] if tipo_relatorio == "fiscal" else [20, 15, 30, 10, 10, 15]
         for i, w in enumerate(widths, 1):
             if i <= len(list(df_aba.columns)): ws.column_dimensions[get_column_letter(i)].width = w
         ws.freeze_panes, ws.auto_filter.ref = "A2", ws.dimensions
 
-    if modo_abas == "unica" or df.empty: 
-        formatar_aba(wb.create_sheet("Extração Completa"), df, "Extração Completa")
+    if modo_abas == "unica" or df.empty: formatar_aba(wb.create_sheet("Extração Completa"), df, "Extração Completa")
     else:
-        for arquivo in df['Arquivo'].unique(): 
-            formatar_aba(wb.create_sheet(), df[df['Arquivo'] == arquivo], arquivo.replace(".pdf", ""))
+        for arquivo in df['Arquivo'].unique(): formatar_aba(wb.create_sheet(), df[df['Arquivo'] == arquivo], arquivo.replace(".pdf", ""))
             
     if not df_erros.empty and tipo_relatorio == "fiscal":
         ws_err = wb.create_sheet("⚠️ Linhas Rejeitadas")
         ws_err.append(["Arquivo de Origem", "Linha Completa Não Processada"])
-        for cell in ws_err[1]: 
-            cell.font, cell.fill, cell.alignment, cell.border = header_font, PatternFill(start_color="C00000", end_color="C00000", fill_type="solid"), Alignment(horizontal="center", vertical="center"), border
-        for row in df_erros.itertuples(index=False): 
-            ws_err.append(list(row))
-        ws_err.column_dimensions['A'].width = 30
-        ws_err.column_dimensions['B'].width = 150
-        ws_err.freeze_panes = "A2"
+        for cell in ws_err[1]: cell.font, cell.fill, cell.alignment, cell.border = header_font, PatternFill(start_color="C00000", end_color="C00000", fill_type="solid"), Alignment(horizontal="center", vertical="center"), border
+        for row in df_erros.itertuples(index=False): ws_err.append(list(row))
+        ws_err.column_dimensions['A'].width, ws_err.column_dimensions['B'].width, ws_err.freeze_panes = 30, 150, "A2"
     
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -194,17 +162,8 @@ def gerar_excel_formatado_em_memoria(df, df_erros, tipo_relatorio, modo_abas):
 st.set_page_config(page_title="Extrator de Relatórios - Apoena", page_icon="📊", layout="wide")
 st.title("📊 Extrator de Relatórios - Apoena")
 
-tipo_selecionado = st.radio(
-    "1. O que deseja extrair?", 
-    options=["fiscal", "hotel", "exames", "refeicoes"], 
-    format_func=lambda x: {"hotel": "Diárias e Consumo", "exames": "Exames Ocupacionais", "refeicoes": "Mapa de Refeições", "fiscal": "Notas Fiscais (Autuação SEFAZ)"}[x]
-)
-
-modo_abas = st.radio(
-    "2. Organização das abas:", 
-    options=["unica", "separadas"], 
-    format_func=lambda x: "📑 Aba Única" if x == "unica" else "📁 Abas Separadas"
-)
+tipo_selecionado = st.radio("1. O que deseja extrair?", options=["fiscal", "hotel", "exames", "refeicoes"], format_func=lambda x: {"hotel": "Diárias e Consumo", "exames": "Exames Ocupacionais", "refeicoes": "Mapa de Refeições", "fiscal": "Notas Fiscais (Autuação SEFAZ)"}[x])
+modo_abas = st.radio("2. Organização das abas:", options=["unica", "separadas"], format_func=lambda x: "📑 Aba Única" if x == "unica" else "📁 Abas Separadas")
 
 usar_ocr = False
 if tipo_selecionado == "fiscal":
@@ -213,18 +172,15 @@ if tipo_selecionado == "fiscal":
 arquivos_selecionados = st.file_uploader("3. Selecione os ficheiros PDF", type=['pdf'], accept_multiple_files=True)
 
 if st.button("Extrair Dados e Gerar Excel", type="primary"):
-    if not arquivos_selecionados: 
-        st.warning("Por favor, selecione pelo menos um ficheiro PDF.")
+    if not arquivos_selecionados: st.warning("Selecione um PDF.")
     else:
         dados_finais, dados_rejeitados, todas_estatisticas = [], [], []
-        with st.spinner("Processando... (O OCR avançado demora cerca de 5 a 10 segundos por página na nuvem)"):
+        with st.spinner("Processando... (O OCR avançado demora cerca de 5-10 segundos por página)"):
             for arquivo_pdf in arquivos_selecionados:
                 try:
                     if tipo_selecionado == "fiscal":
                         res, rej, stats = extrair_linhas_fiscal(arquivo_pdf, usar_ocr)
-                        dados_finais.extend(res)
-                        dados_rejeitados.extend(rej)
-                        todas_estatisticas.append(stats)
+                        dados_finais.extend(res); dados_rejeitados.extend(rej); todas_estatisticas.append(stats)
                     else:
                         with pdfplumber.open(arquivo_pdf) as pdf:
                             linhas = "\n".join([p.extract_text() or "" for p in pdf.pages]).split('\n')
@@ -243,28 +199,18 @@ if st.button("Extrair Dados e Gerar Excel", type="primary"):
                             elif tipo_selecionado == "refeicoes":
                                 dt, tt = "N/D", "N/D"
                                 for l in linhas:
-                                    if "Período:" in l: 
-                                        match_dt = re.search(r'\d{2}/\d{2}/\d{4}', l)
-                                        if match_dt: dt = match_dt.group(0)
+                                    if "Período:" in l: dt = re.search(r'\d{2}/\d{2}/\d{4}', l).group(0) if re.search(r'\d{2}/\d{2}/\d{4}', l) else "N/D"
                                     if "Total Geral" in l: tt = l.replace("Total Geral", "").replace("|", "").strip()
                                 dados_finais.append({"Arquivo": arquivo_pdf.name, "Data": dt, "Total": tt})
-                except Exception as e: 
-                    st.error(f"Erro em {arquivo_pdf.name}: {e}")
-                    st.stop()
+                except Exception as e: st.error(f"Erro em {arquivo_pdf.name}: {e}"); st.stop()
 
         if tipo_selecionado == "fiscal":
             st.markdown("### 🔍 Auditoria")
             for s in todas_estatisticas:
-                if s["Falhas"] == 0: 
-                    st.success(f"✅ **{s['Arquivo']}**: Todas as {s['Total Fiscais Encontradas']} linhas extraídas com sucesso!")
-                else: 
-                    st.warning(f"⚠️ **{s['Arquivo']}**: {s['Sucesso']} sucesso(s), mas **{s['Falhas']} falha(s)** (Verifique a aba vermelha no Excel).")
+                if s["Falhas"] == 0: st.success(f"✅ **{s['Arquivo']}**: Todas as {s['Total Fiscais Encontradas']} linhas extraídas!")
+                else: st.warning(f"⚠️ **{s['Arquivo']}**: {s['Sucesso']} sucesso, **{s['Falhas']} falhas** (Verifique a aba vermelha no Excel).")
 
         if dados_finais or dados_rejeitados:
             df = pd.DataFrame(dados_finais, columns=COLUNAS_CONFIG[tipo_selecionado]) if dados_finais else pd.DataFrame(columns=COLUNAS_CONFIG[tipo_selecionado])
             df_erros = pd.DataFrame(dados_rejeitados)
-            st.download_button(
-                "📥 Descarregar Excel Formatado", 
-                data=gerar_excel_formatado_em_memoria(df, df_erros, tipo_selecionado, modo_abas), 
-                file_name=f"Extracao_{tipo_selecionado}.xlsx"
-            )
+            st.download_button("📥 Descarregar Excel Formatado", data=gerar_excel_formatado_em_memoria(df, df_erros, tipo_selecionado, modo_abas), file_name=f"Extracao_{tipo_selecionado}.xlsx")
