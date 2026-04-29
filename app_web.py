@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Extrator de Relatórios - Apoena
-Inclui: Hotel, Exames, Refeições e Notas Fiscais (PDF)
+Criado em Mon Apr  6 11:22:01 2026
+@author: deborah.goncalves
+Atualizado com extração de Notas Fiscais (PDF)
 """
 
 import streamlit as st
@@ -9,6 +10,7 @@ import pdfplumber
 import pandas as pd
 import re
 import io
+from io import BytesIO
 
 # ==================== CONFIGURAÇÕES ====================
 COLUNAS_CONFIG = {
@@ -16,37 +18,9 @@ COLUNAS_CONFIG = {
     "exames": ["Arquivo", "Exame", "Valor"],
     "refeicoes": ["Arquivo", "Data", "Total"],
     "fiscal": [
-        "data_emissao", "numero_nf", "chave_nfe", "fornecedor", "uf",
+        "Arquivo", "data_emissao", "numero_nf", "chave_nfe", "fornecedor", "uf",
         "descricao", "cfop", "valor_total", "icms_origem", "valor_difal"
     ]
-}
-
-# Mapeamento de cabeçalhos frequentes para colunas normalizadas
-MAPA_COLUNAS_FISCAIS = {
-    'data': 'data_emissao',
-    'data emissão': 'data_emissao',
-    'nº n.f': 'numero_nf',
-    'n. fiscal': 'numero_nf',
-    'nº nota': 'numero_nf',
-    'nf': 'numero_nf',
-    'chave da nota fiscal eletrônica': 'chave_nfe',
-    'chave da nota fiscal eletrónica': 'chave_nfe',
-    'chave nfe': 'chave_nfe',
-    'fornecedor': 'fornecedor',
-    'uf': 'uf',
-    'ncm': 'ncm',
-    'cfop': 'cfop',
-    'descrição da mercadoria': 'descricao',
-    'descrição da mercadoria/serviço': 'descricao',
-    'descrição do documento': 'descricao',
-    'descricao': 'descricao',
-    'valor dos itens': 'valor_total',
-    'valor nf.': 'valor_total',
-    'valor total': 'valor_total',
-    'icms origem': 'icms_origem',
-    'icms': 'icms_origem',
-    'vr difal': 'valor_difal',
-    'difal': 'valor_difal',
 }
 
 # ==================== FUNÇÕES DE EXTRAÇÃO ====================
@@ -75,136 +49,80 @@ def limpar_linha_hotel(linha, nome_hospede):
             }
     return None
 
+
 # --- Fiscal (nova, para PDF) ---
 def extrair_dados_fiscais_pdf(arquivo_pdf):
     """
-    Extrai a tabela de notas fiscais de um PDF e retorna um DataFrame normalizado.
+    Extrai dados fiscais de um PDF de notas fiscais (Anexo I) e retorna um DataFrame.
+    Analisa o texto plano de todas as páginas.
     """
+    # Padrão regex para uma linha de dados completa
+    padrao_linha = re.compile(
+        r'^'
+        r'(\d{2}/\d{2}/\d{4})\s+'          # data (grupo 1)
+        r'(\d+)\s+'                        # nº nf (grupo 2)
+        r'(\d{44})\s+'                     # chave NFe (grupo 3)
+        r'(.+?)\s+'                        # fornecedor (grupo 4) – captura mínima até a UF
+        r'([A-Z]{2})\s+'                   # UF (grupo 5)
+        r'(.+?)\s+'                        # descrição (grupo 6) – termina antes do CFOP
+        r'(\d{4})\s+'                      # CFOP (grupo 7)
+        r'([\d.]+,\d{2})\s+'              # valor total (grupo 8)
+        r'([\d.]+,\d{2})\s+'              # ICMS origem (grupo 9)
+        r'([\d.]+,\d{2})'                 # VR DIFAL (grupo 10)
+        r'\s*$'
+    )
+
+    # Padrão para identificar linhas que devem ser ignoradas
+    padrao_ignorar = re.compile(
+        r'^\s*(Data|TOTAIS\s+DO\s+MÊS|TOTAL\s+DO\s+MÊS|Página|TERMO DE CIÊNCIA|ANEXO|CONTRIBUINTE|DEMONSTRATIVO|Código da Infração|OBS:)',
+        re.IGNORECASE
+    )
+
+    dados = []
     with pdfplumber.open(arquivo_pdf) as pdf:
-        # Tentar extração automática da tabela (funciona para a maioria dos PDFs)
-        tabelas = []
         for pagina in pdf.pages:
-            tabela = pagina.extract_table()
-            if tabela:
-                tabelas.extend(tabela)
+            texto = pagina.extract_text()
+            if not texto:
+                continue
+            linhas = texto.split('\n')
+            for linha in linhas:
+                linha = linha.strip()
+                if not linha or padrao_ignorar.match(linha):
+                    continue
+                match = padrao_linha.match(linha)
+                if match:
+                    dados.append({
+                        'data_emissao': match.group(1),
+                        'numero_nf': match.group(2),
+                        'chave_nfe': match.group(3),
+                        'fornecedor': match.group(4).strip(),
+                        'uf': match.group(5),
+                        'descricao': match.group(6).strip(),
+                        'cfop': match.group(7),
+                        'valor_total': match.group(8),
+                        'icms_origem': match.group(9),
+                        'valor_difal': match.group(10),
+                    })
 
-        if tabelas:
-            return _processar_tabela_extraida(tabelas)
-        else:
-            # Fallback: extrair texto e parse linha a linha
-            texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
-            return _parse_texto_fiscal(texto_completo)
-
-def _processar_tabela_extraida(tabela):
-    """
-    Recebe uma tabela extraída (lista de listas) e normaliza.
-    """
-    # A primeira linha é o cabeçalho
-    cabecalho = tabela[0]
-    # Mapear índices
-    mapa_idx = {}
-    for i, col_name in enumerate(cabecalho):
-        if col_name is None:
-            continue
-        chave = str(col_name).strip().lower()
-        if chave in MAPA_COLUNAS_FISCAIS:
-            mapa_idx[i] = MAPA_COLUNAS_FISCAIS[chave]
-
-    if not mapa_idx:
-        raise ValueError("Não foi possível identificar as colunas no PDF.")
-
-    # Processar linhas de dados
-    dados = []
-    for linha in tabela[1:]:
-        registro = {}
-        for idx, col_padrao in mapa_idx.items():
-            valor = linha[idx] if idx < len(linha) else None
-            registro[col_padrao] = valor.strip() if valor else None
-        # Filtrar linhas completamente vazias
-        if any(v for v in registro.values()):
-            dados.append(registro)
+    if not dados:
+        raise ValueError("Nenhuma linha de dados fiscais foi encontrada no PDF. Verifique se o arquivo contém o Anexo I com as colunas Data, Nº N.F, Chave, etc.")
 
     df = pd.DataFrame(dados)
-    return _converter_tipos(df)
 
-def _parse_texto_fiscal(texto):
-    """
-    Parse alternativo para quando a tabela não é detectada.
-    Cobre os formatos dos seus dois prints.
-    """
-    linhas = texto.split('\n')
-    # Identificar linha de cabeçalho (contém palavras-chave)
-    cabecalho_idx = None
-    for i, linha in enumerate(linhas):
-        if any(palavra in linha.lower() for palavra in ['data', 'nº n.f', 'chave']):
-            cabecalho_idx = i
-            break
-    if cabecalho_idx is None:
-        raise ValueError("Cabeçalho da tabela fiscal não encontrado no PDF.")
+    # Conversão de tipos
+    df['data_emissao'] = pd.to_datetime(df['data_emissao'], dayfirst=True, errors='coerce')
 
-    # Extrair nomes das colunas (podem estar concatenados, ex: "DataNFISCAL...")
-    cabecalho_linha = linhas[cabecalho_idx]
-    # Tentar separar por espaços múltiplos ou por palavras-chave conhecidas
-    # Vamos usar uma abordagem mais robusta: procurar a posição de cada coluna pelo padrão
-    colunas_ordenadas = [
-        ('data', r'\bData\b'),
-        ('numero_nf', r'(N[º°]\s*N\.?\s*F|N\.?\s*Fiscal)'),
-        ('chave_nfe', r'Chave\s*(da\s*)?Nota\s*Fiscal\s*Eletr[ôó]nica'),
-        ('fornecedor', r'Fornecedor'),
-        ('uf', r'\bUF\b'),
-        ('ncm', r'\bNCM\b'),
-        ('cfop', r'\bCFOP\b'),
-        ('descricao', r'Descri[çc][ãa]o\s*(da\s*Mercadoria|do\s*Documento)'),
-        ('valor_total', r'Valor\s*(dos\s*Itens|NF\.?)'),
-        ('icms_origem', r'ICMS\s*Origem'),
-        ('valor_difal', r'(VR\s*DIFAL|DIFAL)'),
-    ]
-    posicoes = {}
-    cabecalho_lower = cabecalho_linha.lower()
-    for nome_padrao, regex in colunas_ordenadas:
-        match = re.search(regex, cabecalho_lower)
-        if match:
-            posicoes[nome_padrao] = match.start()
+    # Converte valores monetários de formato brasileiro (1.234,56) para float
+    def converter_moeda(valor):
+        if isinstance(valor, str):
+            return float(valor.replace('.', '').replace(',', '.'))
+        return valor
 
-    if not posicoes:
-        raise ValueError("Não foi possível interpretar o cabeçalho fiscal.")
+    for col in ['valor_total', 'icms_origem', 'valor_difal']:
+        df[col] = df[col].apply(converter_moeda)
 
-    # Ordenar colunas pela posição
-    colunas_ordenadas = sorted(posicoes.keys(), key=lambda x: posicoes[x])
-
-    # Agora processar as linhas de dados (a partir da linha seguinte)
-    dados = []
-    for linha in linhas[cabecalho_idx+1:]:
-        linha = linha.strip()
-        if not linha or linha.startswith('Página') or linha.startswith('Total'):
-            continue
-        # Tentar particionar a linha pelas posições das colunas
-        registro = {}
-        for i, col in enumerate(colunas_ordenadas):
-            inicio = posicoes[col]
-            fim = posicoes[colunas_ordenadas[i+1]] if i+1 < len(colunas_ordenadas) else len(linha)
-            valor = linha[inicio:fim].strip()
-            if valor:
-                registro[col] = valor
-        if registro:
-            dados.append(registro)
-
-    df = pd.DataFrame(dados)
-    return _converter_tipos(df)
-
-def _converter_tipos(df):
-    """Converte colunas de data e numéricas (formato brasileiro)"""
-    if 'data_emissao' in df.columns:
-        df['data_emissao'] = pd.to_datetime(df['data_emissao'], dayfirst=True, errors='coerce')
-
-    colunas_numericas = ['valor_total', 'icms_origem', 'valor_difal']
-    for col in colunas_numericas:
-        if col in df.columns:
-            # Remover pontos de milhar e trocar vírgula decimal
-            df[col] = df[col].astype(str).str.replace('.', '', regex=False)
-            df[col] = df[col].str.replace(',', '.', regex=False)
-            df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
+
 
 # ==================== INTERFACE STREAMLIT ====================
 st.set_page_config(page_title="Extrator de Relatórios - Apoena", page_icon="📊")
