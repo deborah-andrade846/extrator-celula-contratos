@@ -11,12 +11,12 @@ import pandas as pd
 import re
 import io
 
-# 1. Configuração direta das colunas
+# 1. Configuração das colunas de saída (padronizadas)
 COLUNAS_CONFIG = {
     "hotel": ["Arquivo", "Data", "Informação adicional", "Qtde", "Unidade", "Total"],
     "exames": ["Arquivo", "Exame", "Valor"],
     "refeicoes": ["Arquivo", "Data", "Total"],
-    "notas_fiscais": ["Data", "NF", "Chave_NFe", "Fornecedor", "UF", "Descricao", "CFOP", "Valor_Itens", "ICMS_Origem", "VR_DIFAL"]
+    "notas_fiscais": ["Data", "NF", "Chave_NFe", "Fornecedor", "UF", "Descricao", "CFOP", "NCM", "Valor_Itens", "BC_ICMS", "ICMS_Origem", "VR_DIFAL", "OBS"]
 }
 
 # 2. Lista de UFs brasileiras
@@ -26,11 +26,195 @@ UFS_BRASIL = [
     'RS', 'RO', 'RR', 'SC', 'SP', 'SE', 'TO'
 ]
 
+# 3. Mapeamento de nomes de colunas para nomes padronizados
+MAPA_COLUNAS = {
+    # Data
+    'DATA': 'Data',
+    'DT': 'Data',
+    'DT.': 'Data',
+    'DATA EMISSÃO': 'Data',
+    'DATA EMISSAO': 'Data',
+    'EMISSÃO': 'Data',
+    'EMISSAO': 'Data',
+    
+    # NF
+    'N. FISCAL': 'NF',
+    'Nº N.F': 'NF',
+    'N.F': 'NF',
+    'NF': 'NF',
+    'NÚMERO NF': 'NF',
+    'NUMERO NF': 'NF',
+    'NR NF': 'NF',
+    'NOTA FISCAL': 'NF',
+    
+    # Chave NFe
+    'CHAVE DA NOTA FISCAL ELETRÔNICA': 'Chave_NFe',
+    'CHAVE DA NOTA FISCAL ELETRONICA': 'Chave_NFe',
+    'CHAVE NFE': 'Chave_NFe',
+    'CHAVE NF-E': 'Chave_NFe',
+    'CHAVE DE ACESSO': 'Chave_NFe',
+    'CHAVE': 'Chave_NFe',
+    
+    # Fornecedor
+    'FORNECEDOR': 'Fornecedor',
+    'EMITENTE': 'Fornecedor',
+    'RAZÃO SOCIAL': 'Fornecedor',
+    'RAZAO SOCIAL': 'Fornecedor',
+    'NOME': 'Fornecedor',
+    
+    # UF
+    'UF': 'UF',
+    'ESTADO': 'UF',
+    
+    # Descrição
+    'DESCRIÇÃO DA MERCADORIA': 'Descricao',
+    'DESCRIÇÃO DA MERCADORIA/SERVIÇO': 'Descricao',
+    'DESCRICAO DA MERCADORIA': 'Descricao',
+    'DESCRICAO DA MERCADORIA/SERVICO': 'Descricao',
+    'DESCRIÇÃO': 'Descricao',
+    'DESCRICAO': 'Descricao',
+    'MERCADORIA': 'Descricao',
+    'PRODUTO': 'Descricao',
+    'ITEM': 'Descricao',
+    
+    # CFOP
+    'CFOP': 'CFOP',
+    'CÓDIGO CFOP': 'CFOP',
+    'CODIGO CFOP': 'CFOP',
+    'CFOP CÓD': 'CFOP',
+    
+    # NCM
+    'NCM': 'NCM',
+    'NCM/SH': 'NCM',
+    'CÓDIGO NCM': 'NCM',
+    'CODIGO NCM': 'NCM',
+    
+    # Valor Itens
+    'VALOR DOS ITENS': 'Valor_Itens',
+    'VALOR NF.': 'Valor_Itens',
+    'VALOR NF': 'Valor_Itens',
+    'VALOR TOTAL': 'Valor_Itens',
+    'VALOR DA NOTA': 'Valor_Itens',
+    'VL. TOTAL': 'Valor_Itens',
+    'VLR TOTAL': 'Valor_Itens',
+    'TOTAL NF': 'Valor_Itens',
+    
+    # BC ICMS
+    'BC ICMS': 'BC_ICMS',
+    'BASE DE CÁLCULO': 'BC_ICMS',
+    'BASE DE CALCULO': 'BC_ICMS',
+    'BASE CÁLCULO': 'BC_ICMS',
+    'BASE CALCULO': 'BC_ICMS',
+    'BC': 'BC_ICMS',
+    
+    # ICMS Origem
+    'ICMS ORIGEM': 'ICMS_Origem',
+    'ICMS': 'ICMS_Origem',
+    'ICMS DESTACADO': 'ICMS_Origem',
+    'VL. ICMS': 'ICMS_Origem',
+    'VLR ICMS': 'ICMS_Origem',
+    'ICMS ORIG': 'ICMS_Origem',
+    
+    # VR DIFAL
+    'VR DIFAL': 'VR_DIFAL',
+    'DIFAL': 'VR_DIFAL',
+    'ICMS DIFAL': 'VR_DIFAL',
+    'DIFERENCIAL': 'VR_DIFAL',
+    'DIFERENCIAL DE ALÍQUOTA': 'VR_DIFAL',
+    'DIFERENCIAL DE ALIQUOTA': 'VR_DIFAL',
+    'DIF. ALÍQUOTA': 'VR_DIFAL',
+    'DIF. ALIQUOTA': 'VR_DIFAL',
+    
+    # OBS
+    'OBS': 'OBS',
+    'OBS.': 'OBS',
+    'OBSERVAÇÃO': 'OBS',
+    'OBSERVACAO': 'OBS',
+    'OBSERVAÇÕES': 'OBS',
+    'OBSERVACOES': 'OBS',
+    'COMPLEMENTO': 'OBS',
+    
+    # % Interna (pode ser ignorada ou armazenada)
+    '% INTERNA': 'Pct_Interna',
+    'ALÍQUOTA INTERNA': 'Pct_Interna',
+    'ALIQUOTA INTERNA': 'Pct_Interna',
+    '% INT': 'Pct_Interna',
+    'ALQ INTERNA': 'Pct_Interna',
+}
 
-def extrair_notas_fiscais_pdfplumber(arquivo_pdf):
+
+def normalizar_nome_coluna(nome):
+    """Converte nome de coluna para o nome padronizado"""
+    nome_upper = nome.upper().strip()
+    
+    # Remover caracteres especiais e espaços extras
+    nome_upper = re.sub(r'\s+', ' ', nome_upper)
+    
+    # Buscar no mapeamento
+    if nome_upper in MAPA_COLUNAS:
+        return MAPA_COLUNAS[nome_upper]
+    
+    # Busca parcial (contém)
+    for chave, valor in MAPA_COLUNAS.items():
+        if chave in nome_upper or nome_upper in chave:
+            return valor
+    
+    # Se não encontrou, retorna o nome original
+    return nome
+
+
+def mapear_cabecalho(cabecalho):
     """
-    Extrai dados usando a funcionalidade de tabelas do pdfplumber.
-    Esta é a abordagem mais confiável para PDFs com estrutura tabular.
+    Recebe a linha de cabeçalho e retorna um dicionário:
+    {indice_coluna: nome_padronizado}
+    """
+    mapeamento = {}
+    
+    for idx, coluna in enumerate(cabecalho):
+        if coluna and str(coluna).strip():
+            nome_original = str(coluna).strip()
+            nome_padronizado = normalizar_nome_coluna(nome_original)
+            mapeamento[idx] = nome_padronizado
+    
+    return mapeamento
+
+
+def limpar_valor(valor_str):
+    """Converte string de valor para float de forma robusta"""
+    if not valor_str:
+        return 0.0
+    
+    valor_str = str(valor_str).strip()
+    
+    # Se já é número, retorna
+    try:
+        return float(valor_str)
+    except ValueError:
+        pass
+    
+    # Remove caracteres não numéricos (exceto vírgula e ponto)
+    valor_limpo = re.sub(r'[^\d.,\-]', '', valor_str)
+    
+    if not valor_limpo:
+        return 0.0
+    
+    # Detecta formato brasileiro (vírgula como decimal)
+    if ',' in valor_limpo:
+        # Remove pontos de milhar
+        valor_limpo = valor_limpo.replace('.', '')
+        # Substitui vírgula por ponto
+        valor_limpo = valor_limpo.replace(',', '.')
+    
+    try:
+        return float(valor_limpo)
+    except ValueError:
+        return 0.0
+
+
+def extrair_notas_fiscais_universal(arquivo_pdf):
+    """
+    Extrator UNIVERSAL de notas fiscais.
+    Detecta automaticamente a estrutura do cabeçalho e se adapta.
     """
     
     dados_extraidos = []
@@ -39,14 +223,17 @@ def extrair_notas_fiscais_pdfplumber(arquivo_pdf):
         'paginas_com_tabela': 0,
         'total_linhas_extraidas': 0,
         'nf_unicas': set(),
-        'meses_encontrados': set(),
+        'colunas_detectadas': [],
         'valor_total_itens': 0.0,
         'valor_total_difal': 0.0,
-        'erros': []
+        'erros': [],
+        'layout_detectado': ''
     }
     
     with pdfplumber.open(arquivo_pdf) as pdf:
         metricas['total_paginas'] = len(pdf.pages)
+        
+        mapeamento_colunas = None  # Será definido na primeira tabela encontrada
         
         for num_pagina, pagina in enumerate(pdf.pages):
             # Extrair tabelas da página
@@ -59,23 +246,63 @@ def extrair_notas_fiscais_pdfplumber(arquivo_pdf):
                 if not tabela or len(tabela) < 2:
                     continue
                 
-                # Encontrar linha do cabeçalho
-                cabecalho_idx = -1
-                for i, linha in enumerate(tabela):
-                    if not linha or not any(linha):
+                # Se ainda não temos mapeamento, procurar cabeçalho
+                if mapeamento_colunas is None:
+                    for i, linha in enumerate(tabela):
+                        if not linha or not any(linha):
+                            continue
+                        
+                        # Verificar se esta linha parece um cabeçalho
+                        linha_str = ' '.join([str(c) if c else '' for c in linha])
+                        
+                        # Verificar múltiplos padrões de cabeçalho
+                        padroes_cabecalho = [
+                            ['Data', 'Fornecedor', 'CFOP'],           # Layout 1
+                            ['DATA', 'FORNECEDOR', 'CFOP'],           # Layout 1 (caps)
+                            ['DATA', 'N. FISCAL', 'CHAVE'],           # Layout 2
+                            ['DATA', 'NF', 'UF', 'CFOP'],             # Layout 3
+                            ['DATA', 'CFOP', 'DESCRIÇÃO'],            # Layout 4
+                            ['DATA', 'CFOP', 'DESCRICAO'],            # Layout 4 (sem acento)
+                        ]
+                        
+                        for padrao in padroes_cabecalho:
+                            if all(p in linha_str.upper() for p in [x.upper() for x in padrao]):
+                                # Encontramos o cabeçalho!
+                                mapeamento_colunas = mapear_cabecalho(linha)
+                                metricas['colunas_detectadas'] = list(mapeamento_colunas.values())
+                                
+                                # Identificar layout
+                                cols_detectadas = set(mapeamento_colunas.values())
+                                if 'Fornecedor' in cols_detectadas and 'UF' in cols_detectadas:
+                                    metricas['layout_detectado'] = 'Layout Padrão (Fornecedor + UF)'
+                                elif 'UF' in cols_detectadas and 'NCM' in cols_detectadas:
+                                    metricas['layout_detectado'] = 'Layout Alternativo (UF + NCM)'
+                                else:
+                                    metricas['layout_detectado'] = 'Layout Automático'
+                                
+                                break
+                        
+                        if mapeamento_colunas is not None:
+                            cabecalho_idx = i
+                            break
+                    
+                    if mapeamento_colunas is None:
                         continue
-                    # Verificar se é cabeçalho
-                    linha_str = ' '.join([str(c) if c else '' for c in linha])
-                    if all(palavra in linha_str for palavra in ['Data', 'Fornecedor', 'CFOP']):
-                        cabecalho_idx = i
-                        break
-                
-                if cabecalho_idx == -1:
-                    continue
+                else:
+                    # Procurar cabeçalho novamente (pode mudar entre páginas)
+                    for i, linha in enumerate(tabela):
+                        if not linha or not any(linha):
+                            continue
+                        linha_str = ' '.join([str(c) if c else '' for c in linha])
+                        if all(p in linha_str.upper() for p in ['DATA', 'CFOP']):
+                            cabecalho_idx = i
+                            break
+                    else:
+                        continue
                 
                 metricas['paginas_com_tabela'] += 1
                 
-                # Processar linhas após o cabeçalho
+                # Processar linhas de dados
                 for linha in tabela[cabecalho_idx + 1:]:
                     if not linha or not any(linha):
                         continue
@@ -84,226 +311,101 @@ def extrair_notas_fiscais_pdfplumber(arquivo_pdf):
                     celulas = [str(c).strip() if c else '' for c in linha]
                     
                     # Pular totais
-                    linha_completa = ' '.join(celulas)
-                    if any(p in linha_completa.upper() for p in ['TOTAL DO MÊS', 'TOTAIS DO MÊS', 'TOTAL GERAL']):
+                    linha_completa = ' '.join(celulas).upper()
+                    if any(p in linha_completa for p in ['TOTAL DO MÊS', 'TOTAIS DO MÊS', 'TOTAL GERAL', 'TOTAIS']):
                         continue
                     
-                    # Verificar se tem dados mínimos (pelo menos 8 células preenchidas)
-                    celulas_preenchidas = [c for c in celulas if c]
-                    if len(celulas_preenchidas) < 8:
+                    # Construir dicionário de dados com base no mapeamento
+                    item = {}
+                    
+                    for idx_col, nome_padronizado in mapeamento_colunas.items():
+                        if idx_col < len(celulas):
+                            valor_celula = celulas[idx_col]
+                        else:
+                            valor_celula = ''
+                        
+                        # Armazenar no campo padronizado
+                        if nome_padronizado not in item:
+                            item[nome_padronizado] = valor_celula
+                    
+                    # Validar campos essenciais
+                    data = item.get('Data', '')
+                    nf = item.get('NF', '')
+                    
+                    # Se não tem NF, tentar extrair de Chave_NFe (posições 25-34)
+                    if (not nf or not nf.isdigit()) and item.get('Chave_NFe', ''):
+                        chave = item.get('Chave_NFe', '')
+                        if len(chave) >= 34:
+                            nf = chave[25:34]
+                            item['NF'] = nf
+                    
+                    # Validar data
+                    if not re.match(r'\d{2}/\d{2}/\d{4}', data):
+                        # Tentar encontrar data em outras colunas
+                        for v in item.values():
+                            if re.match(r'\d{2}/\d{2}/\d{4}', str(v)):
+                                data = str(v)
+                                item['Data'] = data
+                                break
+                        else:
+                            continue
+                    
+                    # Validar NF
+                    if not nf or not re.match(r'^\d+$', str(nf)):
                         continue
                     
-                    try:
-                        # Mapear colunas (assumindo ordem padrão)
-                        data = celulas[0] if len(celulas) > 0 else ''
-                        nf = celulas[1] if len(celulas) > 1 else ''
-                        chave_nfe = celulas[2] if len(celulas) > 2 else ''
-                        fornecedor = celulas[3] if len(celulas) > 3 else ''
-                        uf = celulas[4] if len(celulas) > 4 else ''
-                        descricao = celulas[5] if len(celulas) > 5 else ''
-                        cfop = celulas[6] if len(celulas) > 6 else ''
-                        
-                        # Os valores podem estar nas últimas 3 colunas
-                        valor_itens_str = celulas[7] if len(celulas) > 7 else '0'
-                        icms_origem_str = celulas[8] if len(celulas) > 8 else '0'
-                        vr_difal_str = celulas[9] if len(celulas) > 9 else '0'
-                        
-                        # Validar data
-                        if not re.match(r'\d{2}/\d{2}/\d{4}', data):
-                            continue
-                        
-                        # Validar NF (deve ser número)
-                        if not nf.isdigit():
-                            continue
-                        
-                        # Função para limpar e converter valor
-                        def limpar_valor(valor_str):
-                            if not valor_str:
-                                return 0.0
-                            # Remove tudo exceto dígitos, vírgula e ponto
-                            valor_limpo = re.sub(r'[^\d.,]', '', valor_str)
-                            # Se não tem nada, retorna 0
-                            if not valor_limpo:
-                                return 0.0
-                            # Remove pontos de milhar e substitui vírgula por ponto
-                            if ',' in valor_limpo:
-                                # Formato brasileiro: 1.234,56
-                                valor_limpo = valor_limpo.replace('.', '').replace(',', '.')
-                            return float(valor_limpo)
-                        
-                        valor_itens = limpar_valor(valor_itens_str)
-                        icms_origem = limpar_valor(icms_origem_str)
-                        vr_difal = limpar_valor(vr_difal_str)
-                        
-                        # Validar UF
-                        if uf and len(uf) > 2:
-                            # UF pode estar misturada com o fornecedor
-                            # Tentar extrair apenas as 2 letras
-                            match_uf = re.search(r'([A-Z]{2})', uf)
-                            if match_uf:
-                                uf = match_uf.group(1)
-                            else:
-                                uf = uf[:2] if len(uf) >= 2 else uf
-                        
-                        # Limpar fornecedor (remover sufixos/prefixos estranhos)
-                        fornecedor = re.sub(r'\s+', ' ', fornecedor).strip()
-                        # Remover UF do final do fornecedor se estiver duplicada
-                        if uf and fornecedor.endswith(uf):
-                            fornecedor = fornecedor[:-len(uf)].strip()
-                        
-                        # Atualizar métricas
-                        metricas['nf_unicas'].add(nf)
-                        if data and len(data) >= 10:
-                            mes = data[3:5] + '/' + data[6:10]
-                            metricas['meses_encontrados'].add(mes)
-                        metricas['valor_total_itens'] += valor_itens
-                        metricas['valor_total_difal'] += vr_difal
-                        metricas['total_linhas_extraidas'] += 1
-                        
-                        dados_extraidos.append({
-                            "Data": data,
-                            "NF": nf,
-                            "Chave_NFe": chave_nfe,
-                            "Fornecedor": fornecedor,
-                            "UF": uf,
-                            "Descricao": descricao,
-                            "CFOP": cfop,
-                            "Valor_Itens": round(valor_itens, 2),
-                            "ICMS_Origem": round(icms_origem, 2),
-                            "VR_DIFAL": round(vr_difal, 2)
-                        })
-                        
-                    except Exception as e:
-                        metricas['erros'].append({
-                            'pagina': num_pagina + 1,
-                            'linha': celulas[:5] if len(celulas) >= 5 else celulas,
-                            'erro': str(e)[:100]
-                        })
+                    # Converter valores numéricos
+                    campos_numericos = ['Valor_Itens', 'BC_ICMS', 'ICMS_Origem', 'VR_DIFAL', 'Pct_Interna']
+                    for campo in campos_numericos:
+                        if campo in item:
+                            item[campo] = limpar_valor(item[campo])
+                    
+                    # Garantir campos essenciais
+                    item.setdefault('Fornecedor', '')
+                    item.setdefault('UF', '')
+                    item.setdefault('Descricao', '')
+                    item.setdefault('CFOP', '')
+                    item.setdefault('NCM', '')
+                    item.setdefault('Chave_NFe', '')
+                    item.setdefault('OBS', '')
+                    item.setdefault('Valor_Itens', 0.0)
+                    item.setdefault('BC_ICMS', 0.0)
+                    item.setdefault('ICMS_Origem', 0.0)
+                    item.setdefault('VR_DIFAL', 0.0)
+                    
+                    # Validar UF (se presente)
+                    uf = str(item.get('UF', '')).strip().upper()
+                    if uf and len(uf) > 2:
+                        # UF pode estar misturada - extrair apenas 2 letras
+                        match_uf = re.search(r'([A-Z]{2})', uf)
+                        if match_uf:
+                            item['UF'] = match_uf.group(1)
+                        else:
+                            item['UF'] = uf[:2]
+                    
+                    # Atualizar métricas
+                    metricas['nf_unicas'].add(str(nf))
+                    if len(data) >= 10:
+                        mes = data[3:5] + '/' + data[6:10]
+                        if not hasattr(metricas, 'meses_encontrados'):
+                            metricas['meses_encontrados'] = set()
+                        metricas['meses_encontrados'].add(mes)
+                    
+                    metricas['valor_total_itens'] += item.get('Valor_Itens', 0)
+                    metricas['valor_total_difal'] += item.get('VR_DIFAL', 0)
+                    metricas['total_linhas_extraidas'] += 1
+                    
+                    # Adicionar à lista final
+                    dados_extraidos.append(item)
     
+    # Finalizar métricas
     metricas['nf_unicas_count'] = len(metricas['nf_unicas'])
-    metricas['meses_count'] = len(metricas['meses_encontrados'])
-    metricas['meses_encontrados'] = sorted(list(metricas['meses_encontrados']))
-    
-    return dados_extraidos, metricas
-
-
-def extrair_notas_fiscais_texto_fallback(texto_completo):
-    """
-    Fallback: extrai do texto quando a extração por tabela falha.
-    Usa regex mais flexível para lidar com texto desformatado.
-    """
-    
-    linhas = texto_completo.split('\n')
-    dados_extraidos = []
-    metricas = {
-        'total_linhas_extraidas': 0,
-        'nf_unicas': set(),
-        'valor_total_itens': 0.0,
-        'valor_total_difal': 0.0,
-    }
-    
-    cabecalho_encontrado = False
-    
-    for linha in linhas:
-        linha_limpa = linha.strip()
-        
-        if not cabecalho_encontrado:
-            if all(p in linha_limpa for p in ['Data', 'Nº N.F', 'Fornecedor']):
-                cabecalho_encontrado = True
-            continue
-        
-        if not linha_limpa:
-            continue
-            
-        if any(p in linha_limpa.upper() for p in ['TOTAL', 'DEMONSTRATIVO']):
-            continue
-        
-        # Verificar se parece uma linha de dados (começa com data)
-        if not re.match(r'\d{2}/\d{2}/\d{4}', linha_limpa):
-            continue
-        
-        try:
-            # Estratégia: procurar o padrão de valores no final primeiro
-            # Últimos 3 valores numéricos + CFOP antes deles
-            match_final = re.search(r'(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$', linha_limpa)
-            
-            if not match_final:
-                continue
-            
-            cfop = match_final.group(1)
-            
-            def converter_valor(v):
-                v = re.sub(r'[^\d.,]', '', v)
-                if ',' in v:
-                    v = v.replace('.', '').replace(',', '.')
-                return float(v) if v else 0.0
-            
-            valor_itens = converter_valor(match_final.group(2))
-            icms_origem = converter_valor(match_final.group(3))
-            vr_difal = converter_valor(match_final.group(4))
-            
-            # Parte antes dos valores
-            resto = linha_limpa[:match_final.start()].strip()
-            
-            # Data (10 caracteres)
-            data = resto[:10]
-            resto = resto[10:].strip()
-            
-            # NF (primeiro número)
-            match_nf = re.match(r'(\d+)', resto)
-            if not match_nf:
-                continue
-            nf = match_nf.group(1)
-            resto = resto[match_nf.end():].strip()
-            
-            # Chave NFe (44 dígitos)
-            match_chave = re.match(r'(\d{44})', resto)
-            if not match_chave:
-                continue
-            chave_nfe = match_chave.group(1)
-            resto = resto[match_chave.end():].strip()
-            
-            # Encontrar UF (últimas 2 letras maiúsculas antes da descrição final)
-            match_uf = re.search(r'\s+([A-Z]{2})\s+', resto)
-            if match_uf:
-                fornecedor = resto[:match_uf.start()].strip()
-                uf = match_uf.group(1)
-                descricao = resto[match_uf.end():].strip()
-            else:
-                # Fallback: assumir que as últimas 2 letras são UF
-                palavras = resto.split()
-                if len(palavras) >= 2 and len(palavras[-1]) == 2 and palavras[-1].isupper():
-                    uf = palavras[-1]
-                    descricao = ''  # Não conseguimos separar
-                    fornecedor = ' '.join(palavras[:-1])
-                else:
-                    continue
-            
-            fornecedor = re.sub(r'\s+', ' ', fornecedor).strip()
-            descricao = re.sub(r'\s+', ' ', descricao).strip()
-            
-            metricas['nf_unicas'].add(nf)
-            metricas['valor_total_itens'] += valor_itens
-            metricas['valor_total_difal'] += vr_difal
-            metricas['total_linhas_extraidas'] += 1
-            
-            dados_extraidos.append({
-                "Data": data,
-                "NF": nf,
-                "Chave_NFe": chave_nfe,
-                "Fornecedor": fornecedor if fornecedor else "NÃO_IDENTIFICADO",
-                "UF": uf,
-                "Descricao": descricao,
-                "CFOP": cfop,
-                "Valor_Itens": round(valor_itens, 2),
-                "ICMS_Origem": round(icms_origem, 2),
-                "VR_DIFAL": round(vr_difal, 2)
-            })
-            
-        except Exception:
-            continue
-    
-    metricas['nf_unicas_count'] = len(metricas['nf_unicas'])
+    if hasattr(metricas, 'meses_encontrados') and metricas.get('meses_encontrados'):
+        metricas['meses_encontrados'] = sorted(list(metricas['meses_encontrados']))
+        metricas['meses_count'] = len(metricas['meses_encontrados'])
+    else:
+        metricas['meses_encontrados'] = []
+        metricas['meses_count'] = 0
     
     return dados_extraidos, metricas
 
@@ -319,13 +421,14 @@ with st.sidebar:
     mostrar_metricas = st.checkbox("📈 Painel de auditoria", value=True)
     mostrar_preview = st.checkbox("👁️ Preview dos dados", value=True)
     mostrar_erros = st.checkbox("🔍 Mostrar erros de extração", value=False)
+    mostrar_diagnostico = st.checkbox("🔬 Diagnóstico do layout detectado", value=True)
 
 st.markdown("### 1. Tipo de relatório:")
 tipo_selecionado = st.radio(
     "Escolha:",
     options=["notas_fiscais", "hotel", "exames", "refeicoes"],
     format_func=lambda x: {
-        "notas_fiscais": "📋 Notas Fiscais com Produtos (ICMS DIFAL)",
+        "notas_fiscais": "📋 Notas Fiscais (Detecção Automática de Layout)",
         "hotel": "🏨 Diárias e Consumo (Plaza Hotel)",
         "exames": "🩺 Exames Ocupacionais (Biomed)",
         "refeicoes": "🍽️ Mapa de Refeições"
@@ -337,16 +440,16 @@ st.markdown("### 2. Selecione os ficheiros PDF:")
 arquivos_selecionados = st.file_uploader(
     "Arraste e solte ou clique", 
     type=['pdf'], 
-    accept_multiple_files=True
+    accept_multiple_files=True,
+    help="Aceita qualquer layout de notas fiscais (detecção automática)"
 )
 
 if st.button("🚀 Extrair Dados e Gerar Excel", type="primary", use_container_width=True):
     if not arquivos_selecionados:
         st.warning("⚠️ Selecione pelo menos um ficheiro PDF.")
     else:
-        dados_finais = []
-        metricas_gerais = {}
-        erros_extração = []
+        todos_dados = []
+        metricas_consolidadas = {}
         
         import time
         inicio = time.time()
@@ -356,32 +459,23 @@ if st.button("🚀 Extrair Dados e Gerar Excel", type="primary", use_container_w
         
         for idx, arquivo_pdf in enumerate(arquivos_selecionados):
             nome_arquivo = arquivo_pdf.name
-            status_text.text(f"Processando: {nome_arquivo}")
+            status_text.text(f"Processando: {nome_arquivo} ({idx+1}/{len(arquivos_selecionados)})")
             
             if tipo_selecionado == "notas_fiscais":
-                # PRIMEIRO: Tentar extração por tabela (mais confiável)
-                dados, metricas = extrair_notas_fiscais_pdfplumber(arquivo_pdf)
-                
-                # Se extraiu poucas linhas, tentar fallback por texto
-                if metricas['total_linhas_extraidas'] < 10:
-                    st.warning(f"⚠️ Extração por tabela retornou apenas {metricas['total_linhas_extraidas']} linhas. Tentando fallback por texto...")
-                    
-                    with pdfplumber.open(arquivo_pdf) as pdf:
-                        texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
-                    
-                    dados_fallback, metricas_fallback = extrair_notas_fiscais_texto_fallback(texto_completo)
-                    
-                    if metricas_fallback['total_linhas_extraidas'] > metricas['total_linhas_extraidas']:
-                        st.success(f"✅ Fallback extraiu {metricas_fallback['total_linhas_extraidas']} linhas (vs {metricas['total_linhas_extraidas']} por tabela)")
-                        dados = dados_fallback
-                        metricas.update(metricas_fallback)
-                
+                dados, metricas = extrair_notas_fiscais_universal(arquivo_pdf)
                 metricas['nome_arquivo'] = nome_arquivo
-                metricas['num_paginas'] = metricas.get('total_paginas', 0)
                 
-                dados_finais.extend(dados)
-                metricas_gerais = metricas
-                erros_extração = metricas.get('erros', [])
+                todos_dados.extend(dados)
+                metricas_consolidadas = metricas
+                
+                # Mostrar diagnóstico do layout
+                if mostrar_diagnostico and metricas.get('colunas_detectadas'):
+                    st.info(f"""
+                    **📋 Arquivo: {nome_arquivo}**
+                    - **Layout detectado:** {metricas.get('layout_detectado', 'Automático')}
+                    - **Colunas encontradas:** {', '.join(metricas.get('colunas_detectadas', []))}
+                    - **Linhas extraídas:** {metricas.get('total_linhas_extraidas', 0)}
+                    """)
             
             progress_bar.progress((idx + 1) / len(arquivos_selecionados))
         
@@ -389,38 +483,43 @@ if st.button("🚀 Extrair Dados e Gerar Excel", type="primary", use_container_w
         status_text.text("✅ Processamento concluído!")
         
         # ============ RESULTADOS ============
-        if dados_finais:
-            df = pd.DataFrame(dados_finais, columns=COLUNAS_CONFIG[tipo_selecionado])
+        if todos_dados:
+            # Criar DataFrame com todas as colunas possíveis
+            colunas_saida = COLUNAS_CONFIG['notas_fiscais']
+            df = pd.DataFrame(todos_dados)
+            
+            # Garantir que todas as colunas de saída existam
+            for col in colunas_saida:
+                if col not in df.columns:
+                    df[col] = ''
+            
+            df = df[colunas_saida]
             
             # ===== MÉTRICAS =====
-            if mostrar_metricas and metricas_gerais:
+            if mostrar_metricas and metricas_consolidadas:
                 st.markdown("---")
                 st.markdown("## 📊 Painel de Auditoria")
                 
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("📄 Páginas", metricas_gerais.get('num_paginas', metricas_gerais.get('total_paginas', 'N/A')))
+                    st.metric("📄 Páginas", metricas_consolidadas.get('total_paginas', 'N/A'))
                 with col2:
-                    st.metric("🧾 NFs Únicas", metricas_gerais.get('nf_unicas_count', 0))
+                    st.metric("🧾 NFs Únicas", metricas_consolidadas.get('nf_unicas_count', 0))
                 with col3:
-                    st.metric("📝 Linhas Extraídas", len(dados_finais))
+                    st.metric("📝 Linhas Extraídas", len(todos_dados))
                 with col4:
                     st.metric("⏱️ Tempo", f"{tempo_total}s")
                 
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("💰 Valor Total Itens", f"R$ {metricas_gerais.get('valor_total_itens', 0):,.2f}")
+                    st.metric("💰 Valor Total Itens", f"R$ {metricas_consolidadas.get('valor_total_itens', 0):,.2f}")
                 with col2:
-                    st.metric("💵 Total DIFAL", f"R$ {metricas_gerais.get('valor_total_difal', 0):,.2f}")
+                    st.metric("💵 Total DIFAL", f"R$ {metricas_consolidadas.get('valor_total_difal', 0):,.2f}")
+                with col3:
+                    st.metric("🔍 Layout", metricas_consolidadas.get('layout_detectado', 'N/A'))
                 
-                if metricas_gerais.get('meses_encontrados'):
-                    st.markdown(f"**📅 Período:** {' | '.join(metricas_gerais['meses_encontrados'])}")
-            
-            # ===== ERROS =====
-            if mostrar_erros and erros_extração:
-                st.markdown("---")
-                st.markdown(f"## ⚠️ Erros de Extração ({len(erros_extração)})")
-                st.dataframe(pd.DataFrame(erros_extração), use_container_width=True)
+                if metricas_consolidadas.get('meses_encontrados'):
+                    st.markdown(f"**📅 Período:** {' | '.join(metricas_consolidadas['meses_encontrados'])}")
             
             # ===== PREVIEW =====
             if mostrar_preview:
@@ -434,11 +533,6 @@ if st.button("🚀 Extrair Dados e Gerar Excel", type="primary", use_container_w
                 with col2:
                     st.markdown("**Últimos 5 registros:**")
                     st.dataframe(df.tail(), use_container_width=True)
-                
-                # Amostra de fornecedores e UFs
-                with st.expander("🔍 Verificar Fornecedores e UFs extraídos"):
-                    df_uf = df[['Fornecedor', 'UF']].drop_duplicates().head(30)
-                    st.dataframe(df_uf, use_container_width=True)
             
             # ===== DOWNLOAD =====
             st.markdown("---")
@@ -448,35 +542,29 @@ if st.button("🚀 Extrair Dados e Gerar Excel", type="primary", use_container_w
                 df.to_excel(writer, index=False, sheet_name='Dados Extraídos')
                 
                 # Aba de métricas
-                if metricas_gerais:
+                if metricas_consolidadas:
                     dados_met = [
-                        ['Arquivo', metricas_gerais.get('nome_arquivo', 'N/A')],
-                        ['Páginas', metricas_gerais.get('num_paginas', metricas_gerais.get('total_paginas', 0))],
-                        ['Linhas Extraídas', len(dados_finais)],
-                        ['NFs Únicas', metricas_gerais.get('nf_unicas_count', 0)],
-                        ['Meses', metricas_gerais.get('meses_count', 0)],
-                        ['Valor Total Itens (R$)', metricas_gerais.get('valor_total_itens', 0)],
-                        ['Total DIFAL (R$)', metricas_gerais.get('valor_total_difal', 0)],
+                        ['Arquivo', metricas_consolidadas.get('nome_arquivo', 'N/A')],
+                        ['Layout Detectado', metricas_consolidadas.get('layout_detectado', 'N/A')],
+                        ['Colunas Encontradas', ', '.join(metricas_consolidadas.get('colunas_detectadas', []))],
+                        ['Páginas', metricas_consolidadas.get('total_paginas', 0)],
+                        ['Linhas Extraídas', len(todos_dados)],
+                        ['NFs Únicas', metricas_consolidadas.get('nf_unicas_count', 0)],
+                        ['Valor Total Itens (R$)', metricas_consolidadas.get('valor_total_itens', 0)],
+                        ['Total DIFAL (R$)', metricas_consolidadas.get('valor_total_difal', 0)],
                         ['Tempo Processamento (s)', tempo_total],
-                        ['Método', 'pdfplumber (tabelas) + fallback texto'],
                     ]
                     pd.DataFrame(dados_met, columns=['Métrica', 'Valor']).to_excel(
                         writer, index=False, sheet_name='Métricas'
                     )
-                
-                # Aba de erros
-                if erros_extração:
-                    pd.DataFrame(erros_extração).to_excel(
-                        writer, index=False, sheet_name='Erros Extração'
-                    )
             
-            st.success(f"✅ {len(dados_finais)} registros extraídos com sucesso!")
+            st.success(f"✅ {len(todos_dados)} registros extraídos com sucesso!")
             st.download_button(
                 label="📥 Baixar Excel Completo",
                 data=buffer.getvalue(),
-                file_name=f"Extracao_NFs_{metricas_gerais.get('nf_unicas_count', 0)}_NFs.xlsx",
+                file_name=f"Extracao_NFs_{metricas_consolidadas.get('nf_unicas_count', 0)}_NFs.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
         else:
-            st.error("❌ Nenhum dado foi extraído. O PDF pode não conter tabelas reconhecíveis.")
+            st.error("❌ Nenhum dado foi extraído. Verifique se o PDF contém tabelas reconhecíveis.")
