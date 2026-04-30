@@ -230,12 +230,24 @@ def extrair_exames(arquivo_pdf):
                 partes = linha.split("R$")
                 if len(partes) >= 2:
                     nome_exame = partes[0].replace('"', '').replace(',', '').strip()
-                    valor_exame = "R$ " + partes[1].replace('"', '').replace(',', '').strip()
+                    # CORREÇÃO: preserva a vírgula decimal e formata como moeda brasileira
+                    valor_raw = partes[1].replace('"', '').strip()
+                    # Tenta converter para número e depois formatar como R$ XX,XX
+                    try:
+                        # Remove pontos de milhar (se houver) e troca vírgula por ponto
+                        valor_limpo = valor_raw.replace('.', '').replace(',', '.')
+                        valor_num = float(valor_limpo)
+                        # Formata com duas casas decimais e vírgula
+                        valor_formatado = f"R$ {valor_num:,.2f}".replace('.', ',')
+                    except:
+                        # Se falhar, mantém o valor bruto mas sem remover vírgulas
+                        valor_formatado = f"R$ {valor_raw}"
+                    
                     if nome_exame:
                         dados.append({
                             "Arquivo": arquivo_pdf.name,
                             "Exame": nome_exame,
-                            "Valor": valor_exame
+                            "Valor": valor_formatado
                         })
     return dados
 
