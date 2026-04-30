@@ -370,8 +370,6 @@ with st.sidebar:
     st.metric("📄 PDFs Processados", st.session_state.total_processados)
     st.metric("📋 Linhas Extraídas", st.session_state.total_linhas)
     st.markdown("---")
-    st.markdown("### ⚙️ Modo de Processamento")
-    st.info("Seus dados **não saem** do seu computador. Conformidade LGPD garantida.")
 
 # Opções principais
 tipo = st.radio("1. Tipo de relatório:", 
