@@ -67,31 +67,21 @@ def converter_para_numero(valor_str):
         return valor_str
 
 # ==================== OCR COM VISÃO COMPUTACIONAL ====================
-_PALAVRAS_PT = re.compile(
-    r'\b(de|da|do|dos|das|em|para|com|por|se|que|um|uma|total|geral|'
-    r'per[ií]odo|refei[cç][oõ]es|minera[cç][aã]o|administra[cç][aã]o)\b',
-    re.IGNORECASE
-)
-
 def corrigir_rotacao(img_cinza):
-    """Testa as 4 orientacoes e retorna a imagem com mais palavras PT reconhecidas."""
-    candidatos = [
-        img_cinza,
-        cv2.rotate(img_cinza, cv2.ROTATE_90_CLOCKWISE),
-        cv2.rotate(img_cinza, cv2.ROTATE_180),
-        cv2.rotate(img_cinza, cv2.ROTATE_90_COUNTERCLOCKWISE),
-    ]
-    melhor_img, melhor_score = img_cinza, -1
-    for img in candidatos:
-        try:
-            _, bin_ = cv2.threshold(cv2.GaussianBlur(img, (3, 3), 0), 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-            texto = pytesseract.image_to_string(bin_, lang='por+eng', config='--psm 6 --oem 3')
-            score = len(_PALAVRAS_PT.findall(texto))
-            if score > melhor_score:
-                melhor_img, melhor_score = img, score
-        except Exception:
-            continue
-    return melhor_img
+    """Detecta orientação via OSD em resolução reduzida (rápido) e corrige a imagem original."""
+    try:
+        img_baixa = cv2.resize(img_cinza, None, fx=0.5, fy=0.5)
+        osd = pytesseract.image_to_osd(img_baixa, output_type=pytesseract.Output.DICT)
+        rotate = osd.get('rotate', 0)
+        if rotate == 90:
+            return cv2.rotate(img_cinza, cv2.ROTATE_90_CLOCKWISE)
+        elif rotate == 180:
+            return cv2.rotate(img_cinza, cv2.ROTATE_180)
+        elif rotate == 270:
+            return cv2.rotate(img_cinza, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    except Exception:
+        pass
+    return img_cinza
 
 def ler_texto_com_ocr(arquivo_pdf):
     texto_completo = ""
