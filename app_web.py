@@ -67,20 +67,31 @@ def converter_para_numero(valor_str):
         return valor_str
 
 # ==================== OCR COM VISÃO COMPUTACIONAL ====================
+_PALAVRAS_PT = re.compile(
+    r'\b(de|da|do|dos|das|em|para|com|por|se|que|um|uma|total|geral|'
+    r'per[ií]odo|refei[cç][oõ]es|minera[cç][aã]o|administra[cç][aã]o)\b',
+    re.IGNORECASE
+)
+
 def corrigir_rotacao(img_cinza):
-    """Detecta e corrige a orientação da imagem antes do OCR."""
-    try:
-        osd = pytesseract.image_to_osd(img_cinza, output_type=pytesseract.Output.DICT)
-        angulo = osd.get('rotate', 0)
-        if angulo == 90:
-            return cv2.rotate(img_cinza, cv2.ROTATE_90_CLOCKWISE)
-        elif angulo == 180:
-            return cv2.rotate(img_cinza, cv2.ROTATE_180)
-        elif angulo == 270:
-            return cv2.rotate(img_cinza, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    except Exception:
-        pass
-    return img_cinza
+    """Testa as 4 orientacoes e retorna a imagem com mais palavras PT reconhecidas."""
+    candidatos = [
+        img_cinza,
+        cv2.rotate(img_cinza, cv2.ROTATE_90_CLOCKWISE),
+        cv2.rotate(img_cinza, cv2.ROTATE_180),
+        cv2.rotate(img_cinza, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    ]
+    melhor_img, melhor_score = img_cinza, -1
+    for img in candidatos:
+        try:
+            _, bin_ = cv2.threshold(cv2.GaussianBlur(img, (3, 3), 0), 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            texto = pytesseract.image_to_string(bin_, lang='por+eng', config='--psm 6 --oem 3')
+            score = len(_PALAVRAS_PT.findall(texto))
+            if score > melhor_score:
+                melhor_img, melhor_score = img, score
+        except Exception:
+            continue
+    return melhor_img
 
 def ler_texto_com_ocr(arquivo_pdf):
     texto_completo = ""
@@ -513,7 +524,15 @@ if st.button("🚀 Extrair Dados", type="primary"):
             with col2:
                 st.metric("📋 Linhas extraídas", len(dados_totais))
             with col3:
-                taxa = sum(s.sucesso for s in stats_lista) / max(1, sum(s.total_linhas_encontradas for s in stats_lista)) * 100
+                total_encontradas = sum(s.total_linhas_encontradas for s in stats_lista)
+                total_sucesso = sum(s.sucesso for s in stats_lista)
+                if total_encontradas > 0:
+                    # Fiscal: usa linhas encontradas vs processadas com sucesso
+                    taxa = total_sucesso / total_encontradas * 100
+                else:
+                    # Hotel, exames, refeições: usa arquivos com dados vs total de arquivos
+                    arquivos_com_dados = sum(1 for s in stats_lista if s.sucesso > 0)
+                    taxa = arquivos_com_dados / max(1, len(stats_lista)) * 100
                 st.metric("✅ Taxa de sucesso", f"{taxa:.1f}%")
 
         if dados_totais:
