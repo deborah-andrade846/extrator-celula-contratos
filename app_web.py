@@ -67,21 +67,35 @@ def converter_para_numero(valor_str):
         return valor_str
 
 # ==================== OCR COM VISÃO COMPUTACIONAL ====================
+def corrigir_rotacao(img_cinza):
+    """Detecta e corrige a orientação da imagem antes do OCR."""
+    try:
+        osd = pytesseract.image_to_osd(img_cinza, output_type=pytesseract.Output.DICT)
+        angulo = osd.get('rotate', 0)
+        if angulo == 90:
+            return cv2.rotate(img_cinza, cv2.ROTATE_90_CLOCKWISE)
+        elif angulo == 180:
+            return cv2.rotate(img_cinza, cv2.ROTATE_180)
+        elif angulo == 270:
+            return cv2.rotate(img_cinza, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    except Exception:
+        pass
+    return img_cinza
+
 def ler_texto_com_ocr(arquivo_pdf):
     texto_completo = ""
     barra_progresso = st.progress(0, text="A aplicar Visão Computacional e OCR...")
     with pdfplumber.open(arquivo_pdf) as pdf:
         total_paginas = len(pdf.pages)
         for i, pagina in enumerate(pdf.pages):
-            # A resolução pode ser aumentada para 400 se necessário
             img_pil = pagina.to_image(resolution=300).original
             img_cv = np.array(img_pil)
             if len(img_cv.shape) == 3:
                 img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
             img_cinza = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+            img_cinza = corrigir_rotacao(img_cinza)
             img_suave = cv2.GaussianBlur(img_cinza, (3, 3), 0)
             _, img_bin = cv2.threshold(img_suave, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-            # lang='por+eng' para casos com números formatados em inglês
             texto_completo += pytesseract.image_to_string(img_bin, lang='por+eng', config='--psm 6 --oem 3') + "\n"
             barra_progresso.progress((i + 1) / total_paginas, text=f"OCR: Página {i+1} de {total_paginas}")
     barra_progresso.empty()
@@ -281,6 +295,7 @@ def extrair_refeicoes(arquivo_pdf, usar_ocr=False):
                 if len(img_cv.shape) == 3:
                     img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
                 img_cinza = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+                img_cinza = corrigir_rotacao(img_cinza)
                 img_suave = cv2.GaussianBlur(img_cinza, (3, 3), 0)
                 _, img_bin = cv2.threshold(img_suave, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
                 texto_completo += pytesseract.image_to_string(img_bin, lang='por+eng', config='--psm 6 --oem 3') + "\n"
