@@ -251,22 +251,41 @@ def extrair_refeicoes(arquivo_pdf, usar_ocr=False):
     data_refeicao = "DATA_NAO_ENCONTRADA"
     total_refeicoes = "TOTAL_NAO_ENCONTRADO"
     
-    # 1. Tenta texto direto
-    texto_completo = ""
+    # 1. Tenta texto direto — lê só a primeira página (data/período) e a última (Total Geral)
+    texto_primeira = ""
+    texto_ultima = ""
     texto_direto_suficiente = False
     with pdfplumber.open(arquivo_pdf) as pdf:
-        for pagina in pdf.pages:
-            txt = pagina.extract_text()
-            if txt:
-                texto_completo += txt + "\n"
-    
-    if "Período:" in texto_completo and "Total Geral" in texto_completo:
+        txt_primeira = pdf.pages[0].extract_text()
+        if txt_primeira:
+            texto_primeira = txt_primeira
+        txt_ultima = pdf.pages[-1].extract_text()
+        if txt_ultima:
+            texto_ultima = txt_ultima
+
+    texto_completo = texto_primeira + "\n" + texto_ultima
+
+    if re.search(r'per[ií]odo', texto_primeira, re.IGNORECASE) and re.search(r'total\s*geral', texto_ultima, re.IGNORECASE):
         texto_direto_suficiente = True
-    
-    # 2. Se necessário, aplica OCR
+
+    # 2. Se necessário, aplica OCR apenas nas páginas relevantes (primeira e última)
     if usar_ocr or not texto_direto_suficiente:
         st.info(f"Aplicando OCR em {arquivo_pdf.name}...")
-        texto_completo = ler_texto_com_ocr(arquivo_pdf)
+        with pdfplumber.open(arquivo_pdf) as pdf:
+            indices = list({0, len(pdf.pages) - 1})  # primeira e última (evita duplicar se for 1 página)
+            texto_completo = ""
+            barra = st.progress(0, text="OCR nas páginas relevantes...")
+            for j, idx in enumerate(indices):
+                img_pil = pdf.pages[idx].to_image(resolution=300).original
+                img_cv = np.array(img_pil)
+                if len(img_cv.shape) == 3:
+                    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
+                img_cinza = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+                img_suave = cv2.GaussianBlur(img_cinza, (3, 3), 0)
+                _, img_bin = cv2.threshold(img_suave, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                texto_completo += pytesseract.image_to_string(img_bin, lang='por+eng', config='--psm 6 --oem 3') + "\n"
+                barra.progress((j + 1) / len(indices), text=f"OCR: página {idx + 1}")
+            barra.empty()
     
     # ---- DEBUG (opcional) ----
     # st.text_area("Texto bruto do OCR", texto_completo[:3000], height=200)
@@ -277,7 +296,8 @@ def extrair_refeicoes(arquivo_pdf, usar_ocr=False):
     
     # Padrões flexíveis
     data_pattern = r'(\d{2}[/.-]\d{2}[/.-]\d{2,4})'
-    valor_pattern = r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))'
+    # Aceita tanto números com decimais (1.234,56) quanto inteiros simples (436)
+    valor_pattern = r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\d+)'
     
     for i, linha in enumerate(linhas):
         # Procura "Período" (com ou sem acento)
