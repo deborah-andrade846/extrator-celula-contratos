@@ -66,13 +66,14 @@ def converter_para_numero(valor_str):
     except:
         return valor_str
 
-# ==================== OCR COM VISÃO COMPUTACIONAL (FISCAL E REFEIÇÕES) ====================
+# ==================== OCR COM VISÃO COMPUTACIONAL ====================
 def ler_texto_com_ocr(arquivo_pdf):
     texto_completo = ""
     barra_progresso = st.progress(0, text="A aplicar Visão Computacional e OCR...")
     with pdfplumber.open(arquivo_pdf) as pdf:
         total_paginas = len(pdf.pages)
         for i, pagina in enumerate(pdf.pages):
+            # A resolução pode ser aumentada para 400 se necessário
             img_pil = pagina.to_image(resolution=300).original
             img_cv = np.array(img_pil)
             if len(img_cv.shape) == 3:
@@ -80,12 +81,13 @@ def ler_texto_com_ocr(arquivo_pdf):
             img_cinza = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
             img_suave = cv2.GaussianBlur(img_cinza, (3, 3), 0)
             _, img_bin = cv2.threshold(img_suave, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-            texto_completo += pytesseract.image_to_string(img_bin, lang='por', config='--psm 6 --oem 3') + "\n"
+            # lang='por+eng' para casos com números formatados em inglês
+            texto_completo += pytesseract.image_to_string(img_bin, lang='por+eng', config='--psm 6 --oem 3') + "\n"
             barra_progresso.progress((i + 1) / total_paginas, text=f"OCR: Página {i+1} de {total_paginas}")
     barra_progresso.empty()
     return texto_completo
 
-# ==================== PARSER FISCAL (NAI 89701, 92284, MISTO) ====================
+# ==================== PARSER FISCAL ====================
 class FiscalParser:
     PADROES = {
         '89701': re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{44})\s+(.*?)\s+([A-Z]{2})\s+(.*?)\s+(\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$'),
@@ -138,7 +140,6 @@ def extrair_fiscal(arquivo_pdf, usar_ocr: bool):
     dados_locais, rejeitadas = [], []
     stats = EstatisticasProcessamento(arquivo=arquivo_pdf.name)
 
-    # Extrai texto bruto
     if usar_ocr:
         texto = ler_texto_com_ocr(arquivo_pdf)
     else:
@@ -149,7 +150,6 @@ def extrair_fiscal(arquivo_pdf, usar_ocr: bool):
                 if txt:
                     texto += txt + "\n"
 
-    # Limpeza e separação inteligente
     linhas_brutas = texto.split('\n')
     linhas_limpas = []
     for linha in linhas_brutas:
@@ -245,57 +245,71 @@ def extrair_exames(arquivo_pdf):
                         })
     return dados
 
-# ==================== EXTRAÇÃO REFEIÇÕES (AGORA COM OCR) ====================
+# ==================== EXTRAÇÃO REFEIÇÕES (ROBUSTA COM OCR) ====================
 def extrair_refeicoes(arquivo_pdf, usar_ocr=False):
-    """
-    Extrai dados de mapas de refeições. Se usar_ocr=True ou se a extração normal falhar,
-    aplica reconhecimento por visão computacional.
-    """
     dados = []
     data_refeicao = "DATA_NAO_ENCONTRADA"
     total_refeicoes = "TOTAL_NAO_ENCONTRADO"
     
-    # Primeira tentativa: texto direto do PDF
+    # 1. Tenta texto direto
     texto_completo = ""
     texto_direto_suficiente = False
-    
     with pdfplumber.open(arquivo_pdf) as pdf:
         for pagina in pdf.pages:
             txt = pagina.extract_text()
             if txt:
                 texto_completo += txt + "\n"
     
-    # Verifica se o texto extraído contém as palavras-chave (modo digital)
     if "Período:" in texto_completo and "Total Geral" in texto_completo:
         texto_direto_suficiente = True
     
-    # Se não encontrou ou se usuário forçou OCR, aplica OCR
+    # 2. Se necessário, aplica OCR
     if usar_ocr or not texto_direto_suficiente:
-        st.info(f"Aplicando OCR em {arquivo_pdf.name} (documento escaneado detectado)...")
+        st.info(f"Aplicando OCR em {arquivo_pdf.name}...")
         texto_completo = ler_texto_com_ocr(arquivo_pdf)
     
-    # Processa o texto (seja digital ou OCR)
-    linhas = texto_completo.split('\n')
-    for linha in linhas:
-        if "Período:" in linha:
-            match = re.search(r'\d{2}/\d{2}/\d{4}', linha)
-            if match:
-                data_refeicao = match.group(0)
-        if "Total Geral" in linha:
-            # Remove a etiqueta e espaços
-            valor_limpo = linha.replace("Total Geral", "").replace("|", "").strip()
-            # Tenta capturar qualquer valor monetário próximo
-            if not valor_limpo:
-                # Algumas linhas podem ter o valor em outra coluna
-                partes = linha.split()
-                for p in partes:
-                    if re.search(r'\d+,\d{2}', p):
-                        valor_limpo = p
-                        break
-            if valor_limpo:
-                total_refeicoes = valor_limpo
+    # ---- DEBUG (opcional) ----
+    # st.text_area("Texto bruto do OCR", texto_completo[:3000], height=200)
     
-    # Se encontrou pelo menos um dado relevante, adiciona o registro
+    # Limpeza de ruídos comuns de OCR
+    texto_limpo = texto_completo.replace('|', '').replace('—', '-').replace('_', '')
+    linhas = texto_limpo.split('\n')
+    
+    # Padrões flexíveis
+    data_pattern = r'(\d{2}[/.-]\d{2}[/.-]\d{2,4})'
+    valor_pattern = r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))'
+    
+    for i, linha in enumerate(linhas):
+        # Procura "Período" (com ou sem acento)
+        if re.search(r'per[ií]odo', linha, re.IGNORECASE):
+            match_data = re.search(data_pattern, linha)
+            if match_data:
+                data_refeicao = match_data.group(1).replace('-', '/')
+            elif i+1 < len(linhas):
+                match_data = re.search(data_pattern, linhas[i+1])
+                if match_data:
+                    data_refeicao = match_data.group(1).replace('-', '/')
+        
+        # Procura "Total Geral"
+        if re.search(r'total\s*geral', linha, re.IGNORECASE):
+            match_valor = re.search(valor_pattern, linha)
+            if match_valor:
+                total_refeicoes = match_valor.group(1).replace('.', ',').lstrip('0')  # ajusta formato
+            else:
+                for offset in range(1, 3):
+                    if i+offset < len(linhas):
+                        match_valor = re.search(valor_pattern, linhas[i+offset])
+                        if match_valor:
+                            total_refeicoes = match_valor.group(1).replace('.', ',').lstrip('0')
+                            break
+    
+    # Fallback: se não encontrou data, tenta a primeira data do documento
+    if data_refeicao == "DATA_NAO_ENCONTRADA":
+        match_data = re.search(data_pattern, texto_limpo)
+        if match_data:
+            data_refeicao = match_data.group(1).replace('-', '/')
+    
+    # Se encontrou algo, cria o registro
     if data_refeicao != "DATA_NAO_ENCONTRADA" or total_refeicoes != "TOTAL_NAO_ENCONTRADO":
         dados.append({
             "Arquivo": arquivo_pdf.name,
@@ -305,7 +319,7 @@ def extrair_refeicoes(arquivo_pdf, usar_ocr=False):
     
     return dados
 
-# ==================== EXPORTAÇÃO EXCEL FORMATADO ====================
+# ==================== EXPORTAÇÃO EXCEL ====================
 def gerar_excel_formatado(df_principal, df_erros, tipo_relatorio, modo_abas):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -352,7 +366,6 @@ def gerar_excel_formatado(df_principal, df_erros, tipo_relatorio, modo_abas):
 # ==================== INTERFACE STREAMLIT ====================
 st.set_page_config(page_title="Apoena Extrator", layout="wide")
 
-# --- Estilos CSS profissionais ---
 st.markdown("""
 <style>
     .main-header {
@@ -378,7 +391,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Cabeçalho
 col1, col2, col3 = st.columns([1, 5, 1])
 with col2:
     st.markdown('<div class="main-header">', unsafe_allow_html=True)
@@ -390,7 +402,6 @@ with col2:
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# Sidebar com estatísticas (sessão)
 with st.sidebar:
     st.markdown("### 📊 Estatísticas da Sessão")
     if 'total_processados' not in st.session_state:
@@ -400,7 +411,6 @@ with st.sidebar:
     st.metric("📋 Linhas Extraídas", st.session_state.total_linhas)
     st.markdown("---")
 
-# Opções principais
 tipo = st.radio("1. Tipo de relatório:", 
                 options=["fiscal", "hotel", "exames", "refeicoes"],
                 format_func=lambda x: {
@@ -413,14 +423,12 @@ tipo = st.radio("1. Tipo de relatório:",
 modo_abas = st.radio("2. Organização do Excel:", ["unica", "separadas"], 
                      format_func=lambda x: "Uma única aba" if x == "unica" else "Uma aba por arquivo")
 
-# Checkbox de OCR: disponível para Fiscal e Refeições
 usar_ocr = False
 if tipo in ["fiscal", "refeicoes"]:
     usar_ocr = st.checkbox("🔍 OCR Alta Precisão (recomendado para PDFs escaneados ou com falhas)")
 
 arquivos = st.file_uploader("3. Selecione os PDFs:", type=['pdf'], accept_multiple_files=True)
 
-# Botão de extração
 if st.button("🚀 Extrair Dados", type="primary"):
     if not arquivos:
         st.warning("⚠️ Selecione pelo menos um arquivo PDF.")
@@ -455,16 +463,14 @@ if st.button("🚀 Extrair Dados", type="primary"):
                         stats_lista.append(EstatisticasProcessamento(arquivo=arquivo.name, sucesso=len(dados)))
                     
                     elif tipo == "refeicoes":
-                        dados = extrair_refeicoes(arquivo, usar_ocr)  # <-- OCR integrado aqui
+                        dados = extrair_refeicoes(arquivo, usar_ocr)
                         dados_totais.extend(dados)
                         st.success(f"✅ {arquivo.name}: {len(dados)} registros de refeição extraídos.")
                         stats_lista.append(EstatisticasProcessamento(arquivo=arquivo.name, sucesso=len(dados)))
 
-        # Atualiza estatísticas da sessão
         st.session_state.total_processados += len(arquivos)
         st.session_state.total_linhas += len(dados_totais)
 
-        # Exibe resumo visual
         if stats_lista:
             col1, col2, col3 = st.columns(3)
             with col1:
