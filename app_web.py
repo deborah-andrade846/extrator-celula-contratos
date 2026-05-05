@@ -66,7 +66,7 @@ def converter_para_numero(valor_str):
     except:
         return valor_str
 
-# ==================== OCR COM VISÃO COMPUTACIONAL (FISCAL) ====================
+# ==================== OCR COM VISÃO COMPUTACIONAL (FISCAL E REFEIÇÕES) ====================
 def ler_texto_com_ocr(arquivo_pdf):
     texto_completo = ""
     barra_progresso = st.progress(0, text="A aplicar Visão Computacional e OCR...")
@@ -173,7 +173,7 @@ def extrair_fiscal(arquivo_pdf, usar_ocr: bool):
 
     return dados_locais, rejeitadas, stats
 
-# ==================== EXTRAÇÃO HOTEL (código antigo funcional) ====================
+# ==================== EXTRAÇÃO HOTEL ====================
 def limpar_linha_hotel(linha, nome_hospede):
     padrao_data = r'^(\d{2}/\d{2}/\d{2})'
     match = re.search(padrao_data, linha.strip())
@@ -211,7 +211,6 @@ def extrair_hotel(arquivo_pdf):
                 except:
                     pass
                 continue
-            # Pula linhas irrelevantes
             if any(palavra in linha for palavra in ["PLAZA HOTEL", "Apartamento:", "Fechado", "Pagamentos", "Tarifário:"]):
                 continue
             linha_extraida = limpar_linha_hotel(linha, nome_hospede)
@@ -219,7 +218,7 @@ def extrair_hotel(arquivo_pdf):
                 dados.append(linha_extraida)
     return dados
 
-# ==================== EXTRAÇÃO EXAMES (código antigo funcional) ====================
+# ==================== EXTRAÇÃO EXAMES ====================
 def extrair_exames(arquivo_pdf):
     dados = []
     with pdfplumber.open(arquivo_pdf) as pdf:
@@ -230,17 +229,12 @@ def extrair_exames(arquivo_pdf):
                 partes = linha.split("R$")
                 if len(partes) >= 2:
                     nome_exame = partes[0].replace('"', '').replace(',', '').strip()
-                    # CORREÇÃO: preserva a vírgula decimal e formata como moeda brasileira
                     valor_raw = partes[1].replace('"', '').strip()
-                    # Tenta converter para número e depois formatar como R$ XX,XX
                     try:
-                        # Remove pontos de milhar (se houver) e troca vírgula por ponto
                         valor_limpo = valor_raw.replace('.', '').replace(',', '.')
                         valor_num = float(valor_limpo)
-                        # Formata com duas casas decimais e vírgula
                         valor_formatado = f"R$ {valor_num:,.2f}".replace('.', ',')
                     except:
-                        # Se falhar, mantém o valor bruto mas sem remover vírgulas
                         valor_formatado = f"R$ {valor_raw}"
                     
                     if nome_exame:
@@ -251,29 +245,64 @@ def extrair_exames(arquivo_pdf):
                         })
     return dados
 
-# ==================== EXTRAÇÃO REFEIÇÕES (código antigo funcional) ====================
-def extrair_refeicoes(arquivo_pdf):
+# ==================== EXTRAÇÃO REFEIÇÕES (AGORA COM OCR) ====================
+def extrair_refeicoes(arquivo_pdf, usar_ocr=False):
+    """
+    Extrai dados de mapas de refeições. Se usar_ocr=True ou se a extração normal falhar,
+    aplica reconhecimento por visão computacional.
+    """
     dados = []
     data_refeicao = "DATA_NAO_ENCONTRADA"
     total_refeicoes = "TOTAL_NAO_ENCONTRADO"
+    
+    # Primeira tentativa: texto direto do PDF
+    texto_completo = ""
+    texto_direto_suficiente = False
+    
     with pdfplumber.open(arquivo_pdf) as pdf:
-        texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
-        linhas = texto_completo.split('\n')
-        for linha in linhas:
-            if "Período:" in linha:
-                match = re.search(r'\d{2}/\d{2}/\d{4}', linha)
-                if match:
-                    data_refeicao = match.group(0)
-            if "Total Geral" in linha:
-                valor_limpo = linha.replace("Total Geral", "").replace("|", "").strip()
-                if valor_limpo:
-                    total_refeicoes = valor_limpo
-        if data_refeicao != "DATA_NAO_ENCONTRADA" or total_refeicoes != "TOTAL_NAO_ENCONTRADO":
-            dados.append({
-                "Arquivo": arquivo_pdf.name,
-                "Data": data_refeicao,
-                "Total": total_refeicoes
-            })
+        for pagina in pdf.pages:
+            txt = pagina.extract_text()
+            if txt:
+                texto_completo += txt + "\n"
+    
+    # Verifica se o texto extraído contém as palavras-chave (modo digital)
+    if "Período:" in texto_completo and "Total Geral" in texto_completo:
+        texto_direto_suficiente = True
+    
+    # Se não encontrou ou se usuário forçou OCR, aplica OCR
+    if usar_ocr or not texto_direto_suficiente:
+        st.info(f"Aplicando OCR em {arquivo_pdf.name} (documento escaneado detectado)...")
+        texto_completo = ler_texto_com_ocr(arquivo_pdf)
+    
+    # Processa o texto (seja digital ou OCR)
+    linhas = texto_completo.split('\n')
+    for linha in linhas:
+        if "Período:" in linha:
+            match = re.search(r'\d{2}/\d{2}/\d{4}', linha)
+            if match:
+                data_refeicao = match.group(0)
+        if "Total Geral" in linha:
+            # Remove a etiqueta e espaços
+            valor_limpo = linha.replace("Total Geral", "").replace("|", "").strip()
+            # Tenta capturar qualquer valor monetário próximo
+            if not valor_limpo:
+                # Algumas linhas podem ter o valor em outra coluna
+                partes = linha.split()
+                for p in partes:
+                    if re.search(r'\d+,\d{2}', p):
+                        valor_limpo = p
+                        break
+            if valor_limpo:
+                total_refeicoes = valor_limpo
+    
+    # Se encontrou pelo menos um dado relevante, adiciona o registro
+    if data_refeicao != "DATA_NAO_ENCONTRADA" or total_refeicoes != "TOTAL_NAO_ENCONTRADO":
+        dados.append({
+            "Arquivo": arquivo_pdf.name,
+            "Data": data_refeicao,
+            "Total": total_refeicoes
+        })
+    
     return dados
 
 # ==================== EXPORTAÇÃO EXCEL FORMATADO ====================
@@ -384,8 +413,9 @@ tipo = st.radio("1. Tipo de relatório:",
 modo_abas = st.radio("2. Organização do Excel:", ["unica", "separadas"], 
                      format_func=lambda x: "Uma única aba" if x == "unica" else "Uma aba por arquivo")
 
+# Checkbox de OCR: disponível para Fiscal e Refeições
 usar_ocr = False
-if tipo == "fiscal":
+if tipo in ["fiscal", "refeicoes"]:
     usar_ocr = st.checkbox("🔍 OCR Alta Precisão (recomendado para PDFs escaneados ou com falhas)")
 
 arquivos = st.file_uploader("3. Selecione os PDFs:", type=['pdf'], accept_multiple_files=True)
@@ -425,7 +455,7 @@ if st.button("🚀 Extrair Dados", type="primary"):
                         stats_lista.append(EstatisticasProcessamento(arquivo=arquivo.name, sucesso=len(dados)))
                     
                     elif tipo == "refeicoes":
-                        dados = extrair_refeicoes(arquivo)
+                        dados = extrair_refeicoes(arquivo, usar_ocr)  # <-- OCR integrado aqui
                         dados_totais.extend(dados)
                         st.success(f"✅ {arquivo.name}: {len(dados)} registros de refeição extraídos.")
                         stats_lista.append(EstatisticasProcessamento(arquivo=arquivo.name, sucesso=len(dados)))
