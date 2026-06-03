@@ -529,8 +529,10 @@ if st.button("🚀 Extrair Dados", type="primary"):
             df = pd.DataFrame(dados_totais, columns=COLUNAS_CONFIG[tipo])
             df_erros = pd.DataFrame(rejeitados_totais) if rejeitados_totais else pd.DataFrame()
             excel_buffer = gerar_excel_formatado(df, df_erros, tipo, modo_abas)
+            with st.expander(f"👁 Prévia dos dados ({min(5, len(df))} primeiras linhas)", expanded=True):
+                st.dataframe(df.head(5), use_container_width=True)
             st.download_button(
-                label="📥 Descarregar Excel",
+                label="📥 Baixar Excel",
                 data=excel_buffer,
                 file_name=f"Extracao_{tipo}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
