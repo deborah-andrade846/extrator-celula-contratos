@@ -443,8 +443,10 @@ with st.sidebar:
     if 'total_processados' not in st.session_state:
         st.session_state.total_processados = 0
         st.session_state.total_linhas = 0
-    st.metric("📄 PDFs Processados", st.session_state.total_processados)
-    st.metric("📋 Linhas Extraídas", st.session_state.total_linhas)
+    sidebar_processados = st.empty()
+    sidebar_linhas = st.empty()
+    sidebar_processados.metric("📄 PDFs Processados", st.session_state.total_processados)
+    sidebar_linhas.metric("📋 Linhas Extraídas", st.session_state.total_linhas)
     st.markdown("---")
 
 tipo = st.radio("1. Tipo de relatório:", 
@@ -506,6 +508,8 @@ if st.button("🚀 Extrair Dados", type="primary"):
 
         st.session_state.total_processados += len(arquivos)
         st.session_state.total_linhas += len(dados_totais)
+        sidebar_processados.metric("📄 PDFs Processados", st.session_state.total_processados)
+        sidebar_linhas.metric("📋 Linhas Extraídas", st.session_state.total_linhas)
 
         if stats_lista:
             col1, col2, col3 = st.columns(3)
@@ -529,8 +533,10 @@ if st.button("🚀 Extrair Dados", type="primary"):
             df = pd.DataFrame(dados_totais, columns=COLUNAS_CONFIG[tipo])
             df_erros = pd.DataFrame(rejeitados_totais) if rejeitados_totais else pd.DataFrame()
             excel_buffer = gerar_excel_formatado(df, df_erros, tipo, modo_abas)
+            with st.expander(f"👁 Prévia dos dados ({min(5, len(df))} primeiras linhas)", expanded=True):
+                st.dataframe(df.head(5), use_container_width=True)
             st.download_button(
-                label="📥 Descarregar Excel",
+                label="📥 Baixar Excel",
                 data=excel_buffer,
                 file_name=f"Extracao_{tipo}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
