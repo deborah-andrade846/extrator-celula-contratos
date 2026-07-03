@@ -193,28 +193,50 @@ def extrair_fiscal(arquivo_pdf, usar_ocr: bool):
     return dados_locais, rejeitadas, stats
 
 # ==================== EXTRAÇÃO HOTEL ====================
+# Token monetário no formato brasileiro (15,00 / 1.234,56) ou lido pelo OCR com
+# ponto no lugar da vírgula (15.00 / 1.234.56). Sempre com 2 casas decimais, o que
+# evita capturar códigos ou números soltos da descrição.
+_TOKEN_VALOR_HOTEL = re.compile(r'^\d{1,3}(?:\.\d{3})*[.,]\d{2}$')
+
+def _normalizar_valor_hotel(valor: str) -> str:
+    """Padroniza o separador decimal para vírgula (formato brasileiro)."""
+    if valor.count('.') and valor.count(','):
+        # Ex.: 1.234,56 -> mantém
+        return valor
+    # Ex.: 15.00 (OCR leu ponto) -> 15,00
+    return valor.replace('.', ',') if valor.count('.') == 1 and ',' not in valor else valor
+
 def limpar_linha_hotel(linha, nome_hospede):
-    padrao_data = r'^(\d{2}/\d{2}/\d{2})'
-    match = re.search(padrao_data, linha.strip())
-    if match:
-        data = match.group(1)
-        resto = linha[linha.find(data) + len(data):].strip()
-        partes = resto.split()
-        if len(partes) >= 7 and "," in partes[-1] and "," in partes[-6]:
-            total = partes[-1]
-            unidade = partes[-5]
-            qtde = partes[-6]
-            info = " ".join(partes[1:-6]).replace("|", "-").strip()
-            info = info.split(" - Comanda")[0].strip()
-            return {
-                "Arquivo": nome_hospede,
-                "Data": data,
-                "Informação adicional": info,
-                "Qtde": qtde,
-                "Unidade": unidade,
-                "Total": total
-            }
-    return None
+    linha = linha.strip()
+    # 1. A linha precisa começar por uma data (dd/mm/aa ou dd/mm/aaaa)
+    match = re.match(r'^(\d{2}/\d{2}/\d{2,4})\b', linha)
+    if not match:
+        return None
+    data = match.group(1)
+    resto = linha[match.end():].strip()
+    # 2. Remove um horário opcional (HH:MM ou HH:MM:SS) logo após a data
+    resto = re.sub(r'^\d{1,2}:\d{2}(?::\d{2})?\s*', '', resto)
+    partes = resto.split()
+    # 3. Coleta os tokens numéricos finais (Qtde Unidade Bruto Desc. Taxas Total)
+    numericos = []
+    i = len(partes) - 1
+    while i >= 0 and _TOKEN_VALOR_HOTEL.match(partes[i]):
+        numericos.insert(0, partes[i])
+        i -= 1
+    # Precisa ao menos de Qtde, Unidade e Total para ser uma linha de consumo/diária
+    if len(numericos) < 3:
+        return None
+    # 4. Monta a informação adicional (tudo antes dos números)
+    info = " ".join(partes[:i + 1]).replace("|", "-").strip()
+    info = re.split(r'\s*-\s*Comanda', info, flags=re.IGNORECASE)[0].strip()
+    return {
+        "Arquivo": nome_hospede,
+        "Data": data,
+        "Informação adicional": info,
+        "Qtde": _normalizar_valor_hotel(numericos[0]),
+        "Unidade": _normalizar_valor_hotel(numericos[1]),
+        "Total": _normalizar_valor_hotel(numericos[-1])
+    }
 
 def extrair_hotel(arquivo_pdf, usar_ocr=False):
     dados = []
