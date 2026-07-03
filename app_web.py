@@ -67,12 +67,24 @@ def converter_para_numero(valor_str):
         return valor_str
 
 # ==================== OCR COM VISÃO COMPUTACIONAL ====================
+# Confiança mínima do OSD para aceitar uma rotação. O Tesseract às vezes sugere
+# "girar 180°" para páginas já corretas com confiança ínfima (ex.: 0.01); confiar
+# nesse palpite vira uma página boa de cabeça para baixo e destrói o OCR.
+OSD_CONF_MINIMA = 2.0
+
 def corrigir_rotacao(img_cinza):
-    """Detecta orientação via OSD em resolução reduzida (rápido) e corrige a imagem original."""
+    """Detecta orientação via OSD em resolução reduzida (rápido) e corrige a imagem original.
+
+    Só aplica a rotação quando o OSD tem confiança suficiente; caso contrário mantém
+    a imagem original (que, na prática, quase sempre já está na orientação correta).
+    """
     try:
         img_baixa = cv2.resize(img_cinza, None, fx=0.5, fy=0.5)
         osd = pytesseract.image_to_osd(img_baixa, output_type=pytesseract.Output.DICT)
         rotate = osd.get('rotate', 0)
+        conf = float(osd.get('orientation_conf', 0) or 0)
+        if rotate and conf < OSD_CONF_MINIMA:
+            return img_cinza  # palpite pouco confiável: não arrisca girar
         if rotate == 90:
             return cv2.rotate(img_cinza, cv2.ROTATE_90_CLOCKWISE)
         elif rotate == 180:
