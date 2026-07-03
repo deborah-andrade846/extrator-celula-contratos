@@ -522,19 +522,28 @@ if st.button("🚀 Extrair Dados", type="primary"):
                     elif tipo == "hotel":
                         dados = extrair_hotel(arquivo, usar_ocr)
                         dados_totais.extend(dados)
-                        st.success(f"✅ {arquivo.name}: {len(dados)} itens de hotel extraídos.")
+                        if dados:
+                            st.success(f"✅ {arquivo.name}: {len(dados)} itens de hotel extraídos.")
+                        else:
+                            st.warning(f"⚠️ {arquivo.name}: 0 itens extraídos — confira se o PDF tem consumo/diárias ou ative o OCR.")
                         stats_lista.append(EstatisticasProcessamento(arquivo=arquivo.name, sucesso=len(dados)))
-                    
+
                     elif tipo == "exames":
                         dados = extrair_exames(arquivo)
                         dados_totais.extend(dados)
-                        st.success(f"✅ {arquivo.name}: {len(dados)} exames extraídos.")
+                        if dados:
+                            st.success(f"✅ {arquivo.name}: {len(dados)} exames extraídos.")
+                        else:
+                            st.warning(f"⚠️ {arquivo.name}: 0 exames extraídos.")
                         stats_lista.append(EstatisticasProcessamento(arquivo=arquivo.name, sucesso=len(dados)))
-                    
+
                     elif tipo == "refeicoes":
                         dados = extrair_refeicoes(arquivo, usar_ocr)
                         dados_totais.extend(dados)
-                        st.success(f"✅ {arquivo.name}: {len(dados)} registros de refeição extraídos.")
+                        if dados:
+                            st.success(f"✅ {arquivo.name}: {len(dados)} registros de refeição extraídos.")
+                        else:
+                            st.warning(f"⚠️ {arquivo.name}: 0 registros extraídos — confira o PDF ou ative o OCR.")
                         stats_lista.append(EstatisticasProcessamento(arquivo=arquivo.name, sucesso=len(dados)))
 
         st.session_state.total_processados += len(arquivos)
@@ -557,6 +566,16 @@ if st.button("🚀 Extrair Dados", type="primary"):
                     arquivos_com_dados = sum(1 for s in stats_lista if s.sucesso > 0)
                     taxa = arquivos_com_dados / max(1, len(stats_lista)) * 100
                 st.metric("✅ Taxa de sucesso", f"{taxa:.1f}%")
+
+            # Destaca os arquivos que saíram com zero registros (culpados pela taxa < 100%)
+            arquivos_zerados = [s.arquivo for s in stats_lista if s.sucesso == 0]
+            if arquivos_zerados:
+                st.error(
+                    f"❌ {len(arquivos_zerados)} arquivo(s) sem nenhum dado extraído:\n\n"
+                    + "\n".join(f"- {nome}" for nome in arquivos_zerados)
+                    + "\n\nAbra esses PDFs para conferir se realmente têm dados; se tiverem, "
+                      "tente marcar o OCR de Alta Precisão."
+                )
 
         if dados_totais:
             df = pd.DataFrame(dados_totais, columns=COLUNAS_CONFIG[tipo])
