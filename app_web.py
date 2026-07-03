@@ -83,21 +83,25 @@ def corrigir_rotacao(img_cinza):
         pass
     return img_cinza
 
+def ocr_pagina(pagina) -> str:
+    """Aplica Visão Computacional + OCR de alta precisão numa única página do pdfplumber."""
+    img_pil = pagina.to_image(resolution=300).original
+    img_cv = np.array(img_pil)
+    if len(img_cv.shape) == 3:
+        img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
+    img_cinza = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    img_cinza = corrigir_rotacao(img_cinza)
+    img_suave = cv2.GaussianBlur(img_cinza, (3, 3), 0)
+    _, img_bin = cv2.threshold(img_suave, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    return pytesseract.image_to_string(img_bin, lang='por+eng', config='--psm 6 --oem 3')
+
 def ler_texto_com_ocr(arquivo_pdf):
     texto_completo = ""
     barra_progresso = st.progress(0, text="A aplicar Visão Computacional e OCR...")
     with pdfplumber.open(arquivo_pdf) as pdf:
         total_paginas = len(pdf.pages)
         for i, pagina in enumerate(pdf.pages):
-            img_pil = pagina.to_image(resolution=300).original
-            img_cv = np.array(img_pil)
-            if len(img_cv.shape) == 3:
-                img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
-            img_cinza = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-            img_cinza = corrigir_rotacao(img_cinza)
-            img_suave = cv2.GaussianBlur(img_cinza, (3, 3), 0)
-            _, img_bin = cv2.threshold(img_suave, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-            texto_completo += pytesseract.image_to_string(img_bin, lang='por+eng', config='--psm 6 --oem 3') + "\n"
+            texto_completo += ocr_pagina(pagina) + "\n"
             barra_progresso.progress((i + 1) / total_paginas, text=f"OCR: Página {i+1} de {total_paginas}")
     barra_progresso.empty()
     return texto_completo
@@ -212,11 +216,26 @@ def limpar_linha_hotel(linha, nome_hospede):
             }
     return None
 
-def extrair_hotel(arquivo_pdf):
+def extrair_hotel(arquivo_pdf, usar_ocr=False):
     dados = []
     nome_hospede = "NÃO_IDENTIFICADO"
     with pdfplumber.open(arquivo_pdf) as pdf:
+        # 1. Tenta texto direto (rápido)
         texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
+
+        # 2. Aplica OCR de alta precisão se solicitado ou se o texto direto for insuficiente
+        #    (PDF escaneado / sem camada de texto legível)
+        texto_direto_suficiente = "Hóspede principal:" in texto_completo and texto_completo.strip() != ""
+        if usar_ocr or not texto_direto_suficiente:
+            st.info(f"Aplicando OCR de alta precisão em {arquivo_pdf.name}...")
+            total_paginas = len(pdf.pages)
+            barra = st.progress(0, text="OCR nas diárias...")
+            texto_completo = ""
+            for i, pagina in enumerate(pdf.pages):
+                texto_completo += ocr_pagina(pagina) + "\n"
+                barra.progress((i + 1) / total_paginas, text=f"OCR: Página {i+1} de {total_paginas}")
+            barra.empty()
+
         linhas = texto_completo.split('\n')
         for linha in linhas:
             if "Hóspede principal:" in linha:
@@ -291,15 +310,7 @@ def extrair_refeicoes(arquivo_pdf, usar_ocr=False):
             texto_completo = ""
             barra = st.progress(0, text="OCR nas páginas relevantes...")
             for j, idx in enumerate(indices):
-                img_pil = pdf.pages[idx].to_image(resolution=300).original
-                img_cv = np.array(img_pil)
-                if len(img_cv.shape) == 3:
-                    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
-                img_cinza = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-                img_cinza = corrigir_rotacao(img_cinza)
-                img_suave = cv2.GaussianBlur(img_cinza, (3, 3), 0)
-                _, img_bin = cv2.threshold(img_suave, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-                texto_completo += pytesseract.image_to_string(img_bin, lang='por+eng', config='--psm 6 --oem 3') + "\n"
+                texto_completo += ocr_pagina(pdf.pages[idx]) + "\n"
                 barra.progress((j + 1) / len(indices), text=f"OCR: página {idx + 1}")
             barra.empty()
     
@@ -460,7 +471,7 @@ modo_abas = st.radio("2. Organização do Excel:", ["unica", "separadas"],
                      format_func=lambda x: "Uma única aba" if x == "unica" else "Uma aba por arquivo")
 
 usar_ocr = False
-if tipo in ["fiscal", "refeicoes"]:
+if tipo in ["fiscal", "refeicoes", "hotel"]:
     usar_ocr = st.checkbox("🔍 OCR Alta Precisão (recomendado para PDFs escaneados ou com falhas)")
 
 arquivos = st.file_uploader("3. Selecione os PDFs:", type=['pdf'], accept_multiple_files=True)
@@ -487,7 +498,7 @@ if st.button("🚀 Extrair Dados", type="primary"):
                             st.warning(f"⚠️ {arquivo.name}: {stats.sucesso} OK, {stats.falhas} falhas.")
                     
                     elif tipo == "hotel":
-                        dados = extrair_hotel(arquivo)
+                        dados = extrair_hotel(arquivo, usar_ocr)
                         dados_totais.extend(dados)
                         st.success(f"✅ {arquivo.name}: {len(dados)} itens de hotel extraídos.")
                         stats_lista.append(EstatisticasProcessamento(arquivo=arquivo.name, sucesso=len(dados)))
