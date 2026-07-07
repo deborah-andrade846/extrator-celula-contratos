@@ -19,6 +19,7 @@ from dataclasses import dataclass, asdict
 import logging
 from contextlib import contextmanager
 import gc
+import unicodedata
 
 # ==================== CONFIGURAÇÕES GLOBAIS ====================
 COLUNAS_CONFIG = {
@@ -96,21 +97,53 @@ def corrigir_rotacao(img_cinza):
         pass
     return img_cinza
 
-def _preparar_imagem_ocr(pagina):
+_ROTACOES_CV = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+def _preparar_imagem_ocr(pagina, rotacao=None):
     """Rasteriza, corrige a rotação e binariza uma página para OCR de alta precisão.
 
     Devolve a imagem binarizada (numpy) para que os consumidores possam tanto extrair
     o texto puro quanto os dados posicionais (image_to_data) a partir da mesma base.
+
+    Quando ``rotacao`` (0/90/180/270) é informada, aplica exatamente essa rotação; caso
+    contrário decide página a página via OSD (``corrigir_rotacao``).
     """
     img_pil = pagina.to_image(resolution=300).original
     img_cv = np.array(img_pil)
     if len(img_cv.shape) == 3:
         img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
     img_cinza = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    img_cinza = corrigir_rotacao(img_cinza)
+    if rotacao is None:
+        img_cinza = corrigir_rotacao(img_cinza)
+    elif rotacao in _ROTACOES_CV:
+        img_cinza = cv2.rotate(img_cinza, _ROTACOES_CV[rotacao])
     img_suave = cv2.GaussianBlur(img_cinza, (3, 3), 0)
     _, img_bin = cv2.threshold(img_suave, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     return img_bin
+
+def _detectar_rotacao_documento(pdf, amostras=5):
+    """Descobre a rotação predominante do documento com uma votação de OSD.
+
+    O OSD por página às vezes devolve confiança baixa em páginas boas (deixando-as sem
+    girar e ilegíveis). Como todas as páginas do relatório têm a mesma orientação,
+    amostramos as primeiras páginas, somamos a confiança de cada rotação sugerida e
+    aplicamos o vencedor a todas — bem mais robusto que decidir página a página.
+    """
+    from collections import defaultdict
+    votos = defaultdict(float)
+    paginas = pdf.pages[:amostras] if len(pdf.pages) >= amostras else pdf.pages
+    for pagina in paginas:
+        try:
+            img = cv2.cvtColor(np.array(pagina.to_image(resolution=150).original), cv2.COLOR_RGB2GRAY)
+            osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+            votos[int(osd.get('rotate', 0))] += float(osd.get('orientation_conf', 0) or 0)
+        except Exception:
+            pass
+    return max(votos, key=votos.get) if votos else 0
 
 def ocr_pagina(pagina) -> str:
     """Aplica Visão Computacional + OCR de alta precisão numa única página do pdfplumber."""
@@ -450,6 +483,69 @@ _RECUO_EMPRESA_MAX = 0.043
 # A coluna de quantidade fica alinhada à direita da página; só tratamos como total os
 # números que aparecem a partir deste recuo.
 _RECUO_COLUNA_QTDE_MIN = 0.18
+# Nomes de empresa com mais tokens do que isto são, na prática, ruído de OCR.
+_MAX_TOKENS_EMPRESA = 8
+
+# Trechos de rodapé/cabeçalho que às vezes escorregam para a faixa das empresas.
+_LIXO_KEYWORDS = (
+    'copia', 'licenciada', 'n.p.j', 'cnpj', 'foracesso',
+    'gerencial de refeicoes', 'periodo:', 'pagina', 'usuario', 'relatorio de mapa',
+)
+
+def _sem_acento(texto):
+    return ''.join(c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c))
+
+def _linha_de_rodape(texto):
+    """True para linhas de rodapé/cabeçalho (não são empresas)."""
+    t = _sem_acento(texto).lower()
+    return any(k in t for k in _LIXO_KEYWORDS)
+
+def _token_lixo(token):
+    """Token que deve ser removido do fim de um nome de empresa.
+
+    Nomes de empresa vêm em CAIXA ALTA; um token com minúscula só é aceito se for uma
+    palavra em Título com pelo menos 4 letras (ex.: 'Total', 'Vigilância'). O restante
+    (fragmentos minúsculos, símbolos soltos) é ruído de OCR.
+    """
+    if re.fullmatch(r'[A-ZÀ-Ý][a-zà-ÿç]{3,}', token):
+        return False
+    if re.search(r'[a-zà-ÿ]', token):
+        return True
+    if re.search(r'[^0-9A-ZÀ-ÝÇ&/.\-]', token):
+        return True
+    return False
+
+def _nome_empresa_plausivel(nome):
+    if re.search(r'\b0*\d{3,5}\b', nome):        # centro de custo (00002, 00017, ...)
+        return True
+    if re.search(r'[A-ZÀ-ÝÇ]{4,}', nome):        # palavra MAIÚSCULA com 4+ letras
+        return True
+    fortes = re.findall(r'[A-ZÀ-Ý][a-zà-ÿç]{2,}', nome)
+    return len(fortes) >= 2                        # ex.: 'Total Vigilância'
+
+def _limpar_nome_empresa(texto):
+    """Normaliza o texto de uma linha de empresa e rejeita ruído de OCR (devolve '')."""
+    tokens = texto.split()
+    while tokens and _token_lixo(tokens[-1]):
+        tokens.pop()
+    nome = re.sub(r'\s+', ' ', ' '.join(tokens)).strip()
+    if not nome:
+        return ''
+    # Um nome real só usa letras/dígitos e & / - . — qualquer outro símbolo é ruído.
+    if re.search(r'[^0-9A-Za-zÀ-ÿ&/.\- ]', nome):
+        return ''
+    # Caixa errática dentro de um token (ex.: 'SEgESS') é assinatura de OCR embaralhado.
+    if re.search(r'[a-zà-ÿ][A-ZÀ-Ý]', nome):
+        return ''
+    if len(nome.split()) > _MAX_TOKENS_EMPRESA:
+        return ''
+    if not _nome_empresa_plausivel(nome):
+        return ''
+    return nome
+
+def _e_continuacao_de_nome(token):
+    """Fragmento em CAIXA ALTA que continua um nome quebrado em duas linhas (ex.: PIQUE)."""
+    return bool(re.fullmatch(r'[A-ZÀ-ÝÇ]{3,}\.?', token))
 
 def extrair_refeicoes_por_empresa(arquivo_pdf, usar_ocr=False):
     """Extrai o total de refeições agrupado por empresa.
@@ -460,18 +556,25 @@ def extrair_refeicoes_por_empresa(arquivo_pdf, usar_ocr=False):
     quantidade, alinhada à direita; associamos a cada empresa o número que está na
     mesma linha (mesmo "topo" vertical).
 
+    Robustez de OCR:
+      * a rotação é detectada uma única vez para o documento e aplicada a todas as
+        páginas (evita páginas ilegíveis por OSD de baixa confiança);
+      * nomes são limpos de lixo de OCR (símbolos, fragmentos minúsculos, rodapé) e
+        nomes quebrados em duas linhas são reconstruídos.
+
     O parâmetro ``usar_ocr`` existe por simetria com os demais extratores; como este
     relatório é digitalizado (sem camada de texto) e depende do recuo das colunas, o
     OCR posicional é sempre aplicado.
     """
     from collections import defaultdict, OrderedDict
-    ocorrencias = []  # [(nome_empresa, total), ...] na ordem em que aparecem
+    ocorrencias = []  # [[texto_bruto, total], ...] na ordem em que aparecem
 
     with pdfplumber.open(arquivo_pdf) as pdf:
+        rotacao = _detectar_rotacao_documento(pdf)
         total_paginas = len(pdf.pages)
         barra = st.progress(0, text="Lendo empresas do mapa de refeições...")
         for idx, pagina in enumerate(pdf.pages):
-            img_bin = _preparar_imagem_ocr(pagina)
+            img_bin = _preparar_imagem_ocr(pagina, rotacao=rotacao)
             altura, largura = img_bin.shape[:2]
             # Tolerância vertical (~meia altura de linha) para casar rótulo e número.
             tolerancia_linha = 0.012 * altura
@@ -502,34 +605,43 @@ def extrair_refeicoes_por_empresa(arquivo_pdf, usar_ocr=False):
                 rotulos.append((topo, recuo, ' '.join(p[2] for p in palavras)))
             rotulos.sort()
 
+            ultimo_topo = None  # topo da última empresa registrada nesta página
             for topo, recuo, texto in rotulos:
                 if not (_RECUO_EMPRESA_MIN <= recuo < _RECUO_EMPRESA_MAX):
                     continue
-                # Descarta ruído de OCR (ex.: texto vertical do cabeçalho) que caiu na
-                # faixa das empresas: um nome de empresa sempre tem alguma palavra real.
-                if not re.search(r'[A-Za-zÀ-ÿ]{3,}', texto):
+                if _linha_de_rodape(texto):
                     continue
                 candidatos = sorted(
                     (n for n in numeros if abs(n[0] - topo) < tolerancia_linha),
                     key=lambda n: abs(n[0] - topo)
                 )
                 total = candidatos[0][1] if candidatos else None
-                if total is None and ocorrencias:
-                    # Linha na faixa de empresa mas sem número = continuação de um nome
-                    # que quebrou em duas linhas; anexa ao nome da empresa anterior.
-                    nome_ant, total_ant = ocorrencias[-1]
-                    ocorrencias[-1] = (f"{nome_ant} {texto.strip()}", total_ant)
-                else:
-                    ocorrencias.append((texto.strip(), total))
+                if total is None:
+                    # Linha na faixa de empresa mas sem número: só a tratamos como
+                    # continuação de um nome quebrado se for um fragmento curto em CAIXA
+                    # ALTA logo abaixo da empresa anterior (evita engolir rodapé/ruído).
+                    fragmento = texto.split()
+                    if (ocorrencias and ultimo_topo is not None
+                            and 0 < topo - ultimo_topo < tolerancia_linha * 8
+                            and len(fragmento) <= 2
+                            and all(_e_continuacao_de_nome(f) for f in fragmento)):
+                        ocorrencias[-1][0] += ' ' + ' '.join(fragmento)
+                        ultimo_topo = topo
+                    continue
+                ocorrencias.append([texto, total])
+                ultimo_topo = topo
             barra.progress((idx + 1) / total_paginas,
                            text=f"Empresas: página {idx + 1} de {total_paginas}")
         barra.empty()
 
-    # Agrega por empresa (uma mesma empresa pode aparecer em mais de uma categoria de
-    # vínculo, ex.: Matriculado e Visitante) preservando a ordem de aparição.
+    # Limpa os nomes e agrega por empresa (uma mesma empresa pode aparecer em mais de
+    # uma categoria de vínculo, ex.: Matriculado e Visitante), preservando a ordem.
     totais = OrderedDict()
-    for nome, total in ocorrencias:
+    for texto, total in ocorrencias:
         if total is None:
+            continue
+        nome = _limpar_nome_empresa(texto)
+        if not nome:
             continue
         totais[nome] = totais.get(nome, 0) + total
 
