@@ -103,16 +103,17 @@ _ROTACOES_CV = {
     270: cv2.ROTATE_90_COUNTERCLOCKWISE,
 }
 
-def _preparar_imagem_ocr(pagina, rotacao=None):
+def _preparar_imagem_ocr(pagina, rotacao=None, resolucao=300):
     """Rasteriza, corrige a rotação e binariza uma página para OCR de alta precisão.
 
     Devolve a imagem binarizada (numpy) para que os consumidores possam tanto extrair
     o texto puro quanto os dados posicionais (image_to_data) a partir da mesma base.
 
     Quando ``rotacao`` (0/90/180/270) é informada, aplica exatamente essa rotação; caso
-    contrário decide página a página via OSD (``corrigir_rotacao``).
+    contrário decide página a página via OSD (``corrigir_rotacao``). ``resolucao`` (DPI)
+    permite trocar precisão por velocidade quando o texto fino não é necessário.
     """
-    img_pil = pagina.to_image(resolution=300).original
+    img_pil = pagina.to_image(resolution=resolucao).original
     img_cv = np.array(img_pil)
     if len(img_cv.shape) == 3:
         img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
@@ -639,7 +640,10 @@ def extrair_refeicoes_por_empresa(arquivo_pdf, usar_ocr=False):
       * PDF digitalizado (imagem): cai para OCR posicional, detectando a rotação uma
         única vez por documento (evita páginas ilegíveis por OSD de baixa confiança).
 
-    Marcar ``usar_ocr`` força o caminho de OCR mesmo quando há camada de texto.
+    A camada de texto é sempre preferida quando existe (é mais rápida e precisa que o
+    OCR mesmo em "Alta Precisão"); o OCR só entra em PDFs digitalizados ou como fallback
+    quando a leitura direta não encontra empresas. Por isso ``usar_ocr`` não força mais
+    o OCR sobre um PDF que já tem texto — evita 30 s de OCR por arquivo à toa.
     """
     from collections import OrderedDict
     ocorrencias = []  # [[texto_bruto, total], ...] na ordem em que aparecem
@@ -648,20 +652,19 @@ def extrair_refeicoes_por_empresa(arquivo_pdf, usar_ocr=False):
         amostra = pdf.pages[0].extract_text() or ''
         tem_camada_texto = len(amostra) > 200 and re.search(r'refei|per[ií]odo', amostra, re.IGNORECASE)
 
-        if tem_camada_texto and not usar_ocr:
+        if tem_camada_texto:
             for pagina in pdf.pages:
                 tolerancia_linha = 0.012 * pagina.height
                 rotulos, numeros = _rotulos_numeros_texto(pagina, tolerancia_linha)
                 _coletar_empresas_da_pagina(rotulos, numeros, tolerancia_linha, ocorrencias)
 
-        # OCR quando: sem camada de texto, forçado pelo usuário, ou a camada de texto
-        # não rendeu nenhuma empresa (fallback).
+        # OCR quando: sem camada de texto ou a leitura direta não rendeu empresa (fallback).
         if not ocorrencias:
             rotacao = _detectar_rotacao_documento(pdf)
             total_paginas = len(pdf.pages)
             barra = st.progress(0, text="Lendo empresas do mapa de refeições...")
             for idx, pagina in enumerate(pdf.pages):
-                img_bin = _preparar_imagem_ocr(pagina, rotacao=rotacao)
+                img_bin = _preparar_imagem_ocr(pagina, rotacao=rotacao, resolucao=200)
                 tolerancia_linha = 0.012 * img_bin.shape[0]
                 rotulos, numeros = _rotulos_numeros_ocr(img_bin)
                 _coletar_empresas_da_pagina(rotulos, numeros, tolerancia_linha, ocorrencias)
