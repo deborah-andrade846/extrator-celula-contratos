@@ -220,14 +220,18 @@ def _normalizar_valor_hotel(valor: str) -> str:
 
 def limpar_linha_hotel(linha, nome_hospede):
     linha = linha.strip()
-    # 1. A linha precisa começar por uma data (dd/mm/aa ou dd/mm/aaaa)
-    match = re.match(r'^(\d{2}/\d{2}/\d{2,4})\b', linha)
+    # 1. A linha precisa começar por uma data. O dia/mês podem vir com 1 dígito
+    #    porque o OCR às vezes perde um algarismo (ex.: lê "1/06/26" em vez de
+    #    "11/06/26"); sem isso a linha seria descartada.
+    match = re.match(r'^(\d{1,2}/\d{1,2}/\d{2,4})\b', linha)
     if not match:
         return None
     data = match.group(1)
     resto = linha[match.end():].strip()
-    # 2. Remove um horário opcional (HH:MM ou HH:MM:SS) logo após a data
-    resto = re.sub(r'^\d{1,2}:\d{2}(?::\d{2})?\s*', '', resto)
+    # 2. Remove um horário opcional logo após a data. Aceita HH:MM / HH:MM:SS e
+    #    também formas em que o OCR perdeu o separador ou trocou por ponto
+    #    (ex.: "1412", "0915", "10.11").
+    resto = re.sub(r'^\d{1,2}[:.]?\d{2}(?::\d{2})?\s*', '', resto)
     partes = resto.split()
     # 3. Coleta os tokens numéricos finais (Qtde Unidade Bruto Desc. Taxas Total)
     numericos = []
@@ -238,17 +242,43 @@ def limpar_linha_hotel(linha, nome_hospede):
     # Precisa ao menos de Qtde, Unidade e Total para ser uma linha de consumo/diária
     if len(numericos) < 3:
         return None
-    # 4. Monta a informação adicional (tudo antes dos números)
-    info = " ".join(partes[:i + 1]).replace("|", "-").strip()
-    info = re.split(r'\s*-\s*Comanda', info, flags=re.IGNORECASE)[0].strip()
+    # 4. Monta a informação adicional (tudo antes dos números) e captura a Comanda
+    info_completa = " ".join(partes[:i + 1]).replace("|", "-").strip()
+    m_comanda = re.search(r'Comanda\s+([A-Za-z]*\d+)', info_completa, re.IGNORECASE)
+    comanda = m_comanda.group(1).upper() if m_comanda else None
+    info = re.split(r'\s*-\s*Comanda', info_completa, flags=re.IGNORECASE)[0].strip()
     return {
         "Arquivo": nome_hospede,
         "Data": data,
         "Informação adicional": info,
         "Qtde": _normalizar_valor_hotel(numericos[0]),
         "Unidade": _normalizar_valor_hotel(numericos[1]),
-        "Total": _normalizar_valor_hotel(numericos[-1])
+        "Total": _normalizar_valor_hotel(numericos[-1]),
+        "_comanda": comanda
     }
+
+def _corrigir_datas_por_comanda(dados):
+    """Corrige datas quebradas pelo OCR usando a Comanda como âncora.
+
+    Todos os itens de uma mesma Comanda pertencem ao mesmo lançamento (mesma data).
+    Quando o OCR perde um dígito do dia (ex.: "1/06/26" em vez de "11/06/26"),
+    adotamos a data predominante da Comanda, preferindo o formato com dia/mês de
+    2 dígitos em caso de empate.
+    """
+    from collections import defaultdict
+    grupos = defaultdict(list)
+    for d in dados:
+        if d.get("_comanda"):
+            grupos[d["_comanda"]].append(d)
+    canonica = re.compile(r'^\d{2}/\d{2}/\d{2,4}$')
+    for linhas in grupos.values():
+        datas = [l["Data"] for l in linhas]
+        melhor = max(datas, key=lambda dt: (datas.count(dt), 1 if canonica.match(dt) else 0))
+        for l in linhas:
+            l["Data"] = melhor
+    for d in dados:
+        d.pop("_comanda", None)
+    return dados
 
 def extrair_hotel(arquivo_pdf, usar_ocr=False):
     dados = []
@@ -284,7 +314,7 @@ def extrair_hotel(arquivo_pdf, usar_ocr=False):
             linha_extraida = limpar_linha_hotel(linha, nome_hospede)
             if linha_extraida:
                 dados.append(linha_extraida)
-    return dados
+    return _corrigir_datas_por_comanda(dados)
 
 # ==================== EXTRAÇÃO EXAMES ====================
 def extrair_exames(arquivo_pdf):
