@@ -25,6 +25,7 @@ COLUNAS_CONFIG = {
     "hotel": ["Arquivo", "Data", "Informação adicional", "Qtde", "Unidade", "Total"],
     "exames": ["Arquivo", "Exame", "Valor"],
     "refeicoes": ["Arquivo", "Data", "Total"],
+    "refeicoes_empresas": ["Arquivo", "Empresa", "Total"],
     "fiscal": [
         "Arquivo", "Tipo NAI", "Data", "Nº NF", "Chave da NF-e", "Fornecedor", 
         "UF", "NCM", "Descrição", "CFOP", "Valor NF", "BC ICMS", "ICMS", 
@@ -95,8 +96,12 @@ def corrigir_rotacao(img_cinza):
         pass
     return img_cinza
 
-def ocr_pagina(pagina) -> str:
-    """Aplica Visão Computacional + OCR de alta precisão numa única página do pdfplumber."""
+def _preparar_imagem_ocr(pagina):
+    """Rasteriza, corrige a rotação e binariza uma página para OCR de alta precisão.
+
+    Devolve a imagem binarizada (numpy) para que os consumidores possam tanto extrair
+    o texto puro quanto os dados posicionais (image_to_data) a partir da mesma base.
+    """
     img_pil = pagina.to_image(resolution=300).original
     img_cv = np.array(img_pil)
     if len(img_cv.shape) == 3:
@@ -105,7 +110,11 @@ def ocr_pagina(pagina) -> str:
     img_cinza = corrigir_rotacao(img_cinza)
     img_suave = cv2.GaussianBlur(img_cinza, (3, 3), 0)
     _, img_bin = cv2.threshold(img_suave, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    return pytesseract.image_to_string(img_bin, lang='por+eng', config='--psm 6 --oem 3')
+    return img_bin
+
+def ocr_pagina(pagina) -> str:
+    """Aplica Visão Computacional + OCR de alta precisão numa única página do pdfplumber."""
+    return pytesseract.image_to_string(_preparar_imagem_ocr(pagina), lang='por+eng', config='--psm 6 --oem 3')
 
 def ler_texto_com_ocr(arquivo_pdf):
     texto_completo = ""
@@ -430,6 +439,105 @@ def extrair_refeicoes(arquivo_pdf, usar_ocr=False):
     
     return dados
 
+# ==================== REFEIÇÕES: TOTAL POR EMPRESA ====================
+# No Mapa Gerencial de Refeições as linhas são hierárquicas e são identificadas pelo
+# recuo (indentação) horizontal: as categorias de vínculo (Matriculado/Visitante/
+# Contratado) ficam mais à esquerda, seguidas das EMPRESAS, depois os setores e, por
+# fim, as pessoas. Medimos o recuo como fração da largura da página para ficar
+# independente da resolução; a faixa abaixo isola justamente o nível das empresas.
+_RECUO_EMPRESA_MIN = 0.028
+_RECUO_EMPRESA_MAX = 0.043
+# A coluna de quantidade fica alinhada à direita da página; só tratamos como total os
+# números que aparecem a partir deste recuo.
+_RECUO_COLUNA_QTDE_MIN = 0.18
+
+def extrair_refeicoes_por_empresa(arquivo_pdf, usar_ocr=False):
+    """Extrai o total de refeições agrupado por empresa.
+
+    Percorre todas as páginas, agrupa as palavras em linhas e usa o recuo horizontal
+    para identificar as linhas que representam empresas (o nível intermediário da
+    hierarquia do relatório). O total de cada empresa já vem impresso na coluna de
+    quantidade, alinhada à direita; associamos a cada empresa o número que está na
+    mesma linha (mesmo "topo" vertical).
+
+    O parâmetro ``usar_ocr`` existe por simetria com os demais extratores; como este
+    relatório é digitalizado (sem camada de texto) e depende do recuo das colunas, o
+    OCR posicional é sempre aplicado.
+    """
+    from collections import defaultdict, OrderedDict
+    ocorrencias = []  # [(nome_empresa, total), ...] na ordem em que aparecem
+
+    with pdfplumber.open(arquivo_pdf) as pdf:
+        total_paginas = len(pdf.pages)
+        barra = st.progress(0, text="Lendo empresas do mapa de refeições...")
+        for idx, pagina in enumerate(pdf.pages):
+            img_bin = _preparar_imagem_ocr(pagina)
+            altura, largura = img_bin.shape[:2]
+            # Tolerância vertical (~meia altura de linha) para casar rótulo e número.
+            tolerancia_linha = 0.012 * altura
+            dados = pytesseract.image_to_data(
+                img_bin, lang='por+eng', config='--psm 6 --oem 3',
+                output_type=pytesseract.Output.DICT
+            )
+
+            numeros = []                # (topo, valor) dos tokens da coluna de quantidade
+            linhas = defaultdict(list)  # (bloco, par, linha) -> [(left, top, texto)]
+            for i in range(len(dados['text'])):
+                texto = dados['text'][i].strip()
+                if not texto:
+                    continue
+                recuo = dados['left'][i] / largura
+                if re.fullmatch(r'\d{1,5}', texto) and recuo >= _RECUO_COLUNA_QTDE_MIN:
+                    numeros.append((dados['top'][i], int(texto)))
+                    continue
+                chave = (dados['block_num'][i], dados['par_num'][i], dados['line_num'][i])
+                linhas[chave].append((dados['left'][i], dados['top'][i], texto))
+
+            # Reconstrói os rótulos (topo, recuo, texto) e ordena de cima para baixo.
+            rotulos = []
+            for palavras in linhas.values():
+                palavras = sorted(palavras)
+                recuo = palavras[0][0] / largura
+                topo = min(p[1] for p in palavras)
+                rotulos.append((topo, recuo, ' '.join(p[2] for p in palavras)))
+            rotulos.sort()
+
+            for topo, recuo, texto in rotulos:
+                if not (_RECUO_EMPRESA_MIN <= recuo < _RECUO_EMPRESA_MAX):
+                    continue
+                # Descarta ruído de OCR (ex.: texto vertical do cabeçalho) que caiu na
+                # faixa das empresas: um nome de empresa sempre tem alguma palavra real.
+                if not re.search(r'[A-Za-zÀ-ÿ]{3,}', texto):
+                    continue
+                candidatos = sorted(
+                    (n for n in numeros if abs(n[0] - topo) < tolerancia_linha),
+                    key=lambda n: abs(n[0] - topo)
+                )
+                total = candidatos[0][1] if candidatos else None
+                if total is None and ocorrencias:
+                    # Linha na faixa de empresa mas sem número = continuação de um nome
+                    # que quebrou em duas linhas; anexa ao nome da empresa anterior.
+                    nome_ant, total_ant = ocorrencias[-1]
+                    ocorrencias[-1] = (f"{nome_ant} {texto.strip()}", total_ant)
+                else:
+                    ocorrencias.append((texto.strip(), total))
+            barra.progress((idx + 1) / total_paginas,
+                           text=f"Empresas: página {idx + 1} de {total_paginas}")
+        barra.empty()
+
+    # Agrega por empresa (uma mesma empresa pode aparecer em mais de uma categoria de
+    # vínculo, ex.: Matriculado e Visitante) preservando a ordem de aparição.
+    totais = OrderedDict()
+    for nome, total in ocorrencias:
+        if total is None:
+            continue
+        totais[nome] = totais.get(nome, 0) + total
+
+    return [
+        {"Arquivo": arquivo_pdf.name, "Empresa": nome, "Total": total}
+        for nome, total in totais.items()
+    ]
+
 # ==================== EXPORTAÇÃO EXCEL ====================
 def gerar_excel_formatado(df_principal, df_erros, tipo_relatorio, modo_abas):
     wb = openpyxl.Workbook()
@@ -531,7 +639,17 @@ tipo = st.radio("1. Tipo de relatório:",
                     "refeicoes": "Mapa de Refeições"
                 }[x])
 
-modo_abas = st.radio("2. Organização do Excel:", ["unica", "separadas"], 
+sub_refeicoes = "geral"
+if tipo == "refeicoes":
+    sub_refeicoes = st.radio(
+        "1b. Detalhamento do mapa de refeições:",
+        options=["geral", "empresa"],
+        format_func=lambda x: "Total geral (por arquivo)" if x == "geral" else "Total por empresa",
+        help="'Total por empresa' lê todas as páginas e soma as refeições de cada empresa "
+             "(linhas com recuo à esquerda na hierarquia do relatório)."
+    )
+
+modo_abas = st.radio("2. Organização do Excel:", ["unica", "separadas"],
                      format_func=lambda x: "Uma única aba" if x == "unica" else "Uma aba por arquivo")
 
 usar_ocr = False
@@ -580,12 +698,17 @@ if st.button("🚀 Extrair Dados", type="primary"):
                         stats_lista.append(EstatisticasProcessamento(arquivo=arquivo.name, sucesso=len(dados)))
 
                     elif tipo == "refeicoes":
-                        dados = extrair_refeicoes(arquivo, usar_ocr)
+                        if sub_refeicoes == "empresa":
+                            dados = extrair_refeicoes_por_empresa(arquivo, usar_ocr)
+                            rotulo_item = "empresas"
+                        else:
+                            dados = extrair_refeicoes(arquivo, usar_ocr)
+                            rotulo_item = "registros de refeição"
                         dados_totais.extend(dados)
                         if dados:
-                            st.success(f"✅ {arquivo.name}: {len(dados)} registros de refeição extraídos.")
+                            st.success(f"✅ {arquivo.name}: {len(dados)} {rotulo_item} extraídos.")
                         else:
-                            st.warning(f"⚠️ {arquivo.name}: 0 registros extraídos — confira o PDF ou ative o OCR.")
+                            st.warning(f"⚠️ {arquivo.name}: 0 {rotulo_item} extraídos — confira o PDF ou ative o OCR.")
                         stats_lista.append(EstatisticasProcessamento(arquivo=arquivo.name, sucesso=len(dados)))
 
         st.session_state.total_processados += len(arquivos)
@@ -619,16 +742,19 @@ if st.button("🚀 Extrair Dados", type="primary"):
                       "tente marcar o OCR de Alta Precisão."
                 )
 
+        # Quando o mapa de refeições é detalhado por empresa, o layout de saída muda.
+        tipo_saida = "refeicoes_empresas" if (tipo == "refeicoes" and sub_refeicoes == "empresa") else tipo
+
         if dados_totais:
-            df = pd.DataFrame(dados_totais, columns=COLUNAS_CONFIG[tipo])
+            df = pd.DataFrame(dados_totais, columns=COLUNAS_CONFIG[tipo_saida])
             df_erros = pd.DataFrame(rejeitados_totais) if rejeitados_totais else pd.DataFrame()
-            excel_buffer = gerar_excel_formatado(df, df_erros, tipo, modo_abas)
+            excel_buffer = gerar_excel_formatado(df, df_erros, tipo_saida, modo_abas)
             with st.expander(f"👁 Prévia dos dados ({min(5, len(df))} primeiras linhas)", expanded=True):
                 st.dataframe(df.head(5), use_container_width=True)
             st.download_button(
                 label="📥 Baixar Excel",
                 data=excel_buffer,
-                file_name=f"Extracao_{tipo}.xlsx",
+                file_name=f"Extracao_{tipo_saida}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
