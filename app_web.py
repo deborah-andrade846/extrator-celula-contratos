@@ -547,92 +547,127 @@ def _e_continuacao_de_nome(token):
     """Fragmento em CAIXA ALTA que continua um nome quebrado em duas linhas (ex.: PIQUE)."""
     return bool(re.fullmatch(r'[A-ZÀ-ÝÇ]{3,}\.?', token))
 
+def _montar_rotulos(linhas):
+    """Recebe grupos de palavras {chave: [(left, top, texto), ...]} e devolve rótulos
+    (topo, recuo_em_px, texto) ordenados de cima para baixo. O ``recuo_em_px`` deve ser
+    dividido pela largura da página pelo chamador para virar fração."""
+    rotulos = []
+    for palavras in linhas.values():
+        palavras = sorted(palavras)
+        rotulos.append((min(p[1] for p in palavras), palavras[0][0], ' '.join(p[2] for p in palavras)))
+    rotulos.sort()
+    return rotulos
+
+def _rotulos_numeros_texto(pagina, tolerancia_linha):
+    """Extrai rótulos e números direto da camada de texto do PDF (nativo, sem OCR)."""
+    from collections import defaultdict
+    largura = pagina.width
+    numeros = []
+    linhas = defaultdict(list)
+    for w in pagina.extract_words():
+        texto = w['text'].strip()
+        if not texto:
+            continue
+        if re.fullmatch(r'\d{1,5}', texto) and (w['x0'] / largura) >= _RECUO_COLUNA_QTDE_MIN:
+            numeros.append((w['top'], int(texto)))
+            continue
+        # Agrupa por linha usando a proximidade vertical (mesma faixa de "topo").
+        linhas[round(w['top'] / tolerancia_linha)].append((w['x0'], w['top'], texto))
+    rotulos = [(topo, left / largura, texto) for topo, left, texto in _montar_rotulos(linhas)]
+    return rotulos, numeros
+
+def _rotulos_numeros_ocr(img_bin):
+    """Extrai rótulos e números de uma página digitalizada via OCR posicional."""
+    from collections import defaultdict
+    largura = img_bin.shape[1]
+    dados = pytesseract.image_to_data(
+        img_bin, lang='por+eng', config='--psm 6 --oem 3',
+        output_type=pytesseract.Output.DICT
+    )
+    numeros = []
+    linhas = defaultdict(list)  # (bloco, par, linha) -> [(left, top, texto)]
+    for i in range(len(dados['text'])):
+        texto = dados['text'][i].strip()
+        if not texto:
+            continue
+        if re.fullmatch(r'\d{1,5}', texto) and (dados['left'][i] / largura) >= _RECUO_COLUNA_QTDE_MIN:
+            numeros.append((dados['top'][i], int(texto)))
+            continue
+        chave = (dados['block_num'][i], dados['par_num'][i], dados['line_num'][i])
+        linhas[chave].append((dados['left'][i], dados['top'][i], texto))
+    rotulos = [(topo, left / largura, texto) for topo, left, texto in _montar_rotulos(linhas)]
+    return rotulos, numeros
+
+def _coletar_empresas_da_pagina(rotulos, numeros, tolerancia_linha, ocorrencias):
+    """Percorre os rótulos de uma página, isola os que estão na faixa de recuo das
+    empresas e associa o total da mesma linha, acumulando em ``ocorrencias`` (mutado)."""
+    ultimo_topo = None  # topo da última empresa registrada nesta página
+    for topo, recuo, texto in rotulos:
+        if not (_RECUO_EMPRESA_MIN <= recuo < _RECUO_EMPRESA_MAX):
+            continue
+        if _linha_de_rodape(texto):
+            continue
+        candidatos = sorted(
+            (n for n in numeros if abs(n[0] - topo) < tolerancia_linha),
+            key=lambda n: abs(n[0] - topo)
+        )
+        total = candidatos[0][1] if candidatos else None
+        if total is None:
+            # Linha na faixa de empresa mas sem número: só a tratamos como continuação
+            # de um nome quebrado se for um fragmento curto em CAIXA ALTA logo abaixo da
+            # empresa anterior (evita engolir rodapé/ruído).
+            fragmento = texto.split()
+            if (ocorrencias and ultimo_topo is not None
+                    and 0 < topo - ultimo_topo < tolerancia_linha * 8
+                    and len(fragmento) <= 2
+                    and all(_e_continuacao_de_nome(f) for f in fragmento)):
+                ocorrencias[-1][0] += ' ' + ' '.join(fragmento)
+                ultimo_topo = topo
+            continue
+        ocorrencias.append([texto, total])
+        ultimo_topo = topo
+
 def extrair_refeicoes_por_empresa(arquivo_pdf, usar_ocr=False):
     """Extrai o total de refeições agrupado por empresa.
 
-    Percorre todas as páginas, agrupa as palavras em linhas e usa o recuo horizontal
-    para identificar as linhas que representam empresas (o nível intermediário da
-    hierarquia do relatório). O total de cada empresa já vem impresso na coluna de
-    quantidade, alinhada à direita; associamos a cada empresa o número que está na
-    mesma linha (mesmo "topo" vertical).
+    Identifica as empresas pelo recuo horizontal (o nível intermediário da hierarquia
+    do relatório) e associa a cada uma o total já impresso na coluna de quantidade.
 
-    Robustez de OCR:
-      * a rotação é detectada uma única vez para o documento e aplicada a todas as
-        páginas (evita páginas ilegíveis por OSD de baixa confiança);
-      * nomes são limpos de lixo de OCR (símbolos, fragmentos minúsculos, rodapé) e
-        nomes quebrados em duas linhas são reconstruídos.
+    Funciona com os dois formatos do relatório:
+      * PDF nativo (com camada de texto): lê as palavras e suas posições diretamente,
+        sem OCR — mais rápido e sem ruído;
+      * PDF digitalizado (imagem): cai para OCR posicional, detectando a rotação uma
+        única vez por documento (evita páginas ilegíveis por OSD de baixa confiança).
 
-    O parâmetro ``usar_ocr`` existe por simetria com os demais extratores; como este
-    relatório é digitalizado (sem camada de texto) e depende do recuo das colunas, o
-    OCR posicional é sempre aplicado.
+    Marcar ``usar_ocr`` força o caminho de OCR mesmo quando há camada de texto.
     """
-    from collections import defaultdict, OrderedDict
+    from collections import OrderedDict
     ocorrencias = []  # [[texto_bruto, total], ...] na ordem em que aparecem
 
     with pdfplumber.open(arquivo_pdf) as pdf:
-        rotacao = _detectar_rotacao_documento(pdf)
-        total_paginas = len(pdf.pages)
-        barra = st.progress(0, text="Lendo empresas do mapa de refeições...")
-        for idx, pagina in enumerate(pdf.pages):
-            img_bin = _preparar_imagem_ocr(pagina, rotacao=rotacao)
-            altura, largura = img_bin.shape[:2]
-            # Tolerância vertical (~meia altura de linha) para casar rótulo e número.
-            tolerancia_linha = 0.012 * altura
-            dados = pytesseract.image_to_data(
-                img_bin, lang='por+eng', config='--psm 6 --oem 3',
-                output_type=pytesseract.Output.DICT
-            )
+        amostra = pdf.pages[0].extract_text() or ''
+        tem_camada_texto = len(amostra) > 200 and re.search(r'refei|per[ií]odo', amostra, re.IGNORECASE)
 
-            numeros = []                # (topo, valor) dos tokens da coluna de quantidade
-            linhas = defaultdict(list)  # (bloco, par, linha) -> [(left, top, texto)]
-            for i in range(len(dados['text'])):
-                texto = dados['text'][i].strip()
-                if not texto:
-                    continue
-                recuo = dados['left'][i] / largura
-                if re.fullmatch(r'\d{1,5}', texto) and recuo >= _RECUO_COLUNA_QTDE_MIN:
-                    numeros.append((dados['top'][i], int(texto)))
-                    continue
-                chave = (dados['block_num'][i], dados['par_num'][i], dados['line_num'][i])
-                linhas[chave].append((dados['left'][i], dados['top'][i], texto))
+        if tem_camada_texto and not usar_ocr:
+            for pagina in pdf.pages:
+                tolerancia_linha = 0.012 * pagina.height
+                rotulos, numeros = _rotulos_numeros_texto(pagina, tolerancia_linha)
+                _coletar_empresas_da_pagina(rotulos, numeros, tolerancia_linha, ocorrencias)
 
-            # Reconstrói os rótulos (topo, recuo, texto) e ordena de cima para baixo.
-            rotulos = []
-            for palavras in linhas.values():
-                palavras = sorted(palavras)
-                recuo = palavras[0][0] / largura
-                topo = min(p[1] for p in palavras)
-                rotulos.append((topo, recuo, ' '.join(p[2] for p in palavras)))
-            rotulos.sort()
-
-            ultimo_topo = None  # topo da última empresa registrada nesta página
-            for topo, recuo, texto in rotulos:
-                if not (_RECUO_EMPRESA_MIN <= recuo < _RECUO_EMPRESA_MAX):
-                    continue
-                if _linha_de_rodape(texto):
-                    continue
-                candidatos = sorted(
-                    (n for n in numeros if abs(n[0] - topo) < tolerancia_linha),
-                    key=lambda n: abs(n[0] - topo)
-                )
-                total = candidatos[0][1] if candidatos else None
-                if total is None:
-                    # Linha na faixa de empresa mas sem número: só a tratamos como
-                    # continuação de um nome quebrado se for um fragmento curto em CAIXA
-                    # ALTA logo abaixo da empresa anterior (evita engolir rodapé/ruído).
-                    fragmento = texto.split()
-                    if (ocorrencias and ultimo_topo is not None
-                            and 0 < topo - ultimo_topo < tolerancia_linha * 8
-                            and len(fragmento) <= 2
-                            and all(_e_continuacao_de_nome(f) for f in fragmento)):
-                        ocorrencias[-1][0] += ' ' + ' '.join(fragmento)
-                        ultimo_topo = topo
-                    continue
-                ocorrencias.append([texto, total])
-                ultimo_topo = topo
-            barra.progress((idx + 1) / total_paginas,
-                           text=f"Empresas: página {idx + 1} de {total_paginas}")
-        barra.empty()
+        # OCR quando: sem camada de texto, forçado pelo usuário, ou a camada de texto
+        # não rendeu nenhuma empresa (fallback).
+        if not ocorrencias:
+            rotacao = _detectar_rotacao_documento(pdf)
+            total_paginas = len(pdf.pages)
+            barra = st.progress(0, text="Lendo empresas do mapa de refeições...")
+            for idx, pagina in enumerate(pdf.pages):
+                img_bin = _preparar_imagem_ocr(pagina, rotacao=rotacao)
+                tolerancia_linha = 0.012 * img_bin.shape[0]
+                rotulos, numeros = _rotulos_numeros_ocr(img_bin)
+                _coletar_empresas_da_pagina(rotulos, numeros, tolerancia_linha, ocorrencias)
+                barra.progress((idx + 1) / total_paginas,
+                               text=f"Empresas: página {idx + 1} de {total_paginas}")
+            barra.empty()
 
     # Limpa os nomes e agrega por empresa (uma mesma empresa pode aparecer em mais de
     # uma categoria de vínculo, ex.: Matriculado e Visitante), preservando a ordem.
