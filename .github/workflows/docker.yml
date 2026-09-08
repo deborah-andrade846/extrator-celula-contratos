@@ -1,0 +1,40 @@
+name: Imagem Docker
+
+# Constrói e testa a imagem usada para hospedar o Extrator (Render, Fly.io, Railway,
+# Hugging Face Spaces ou servidor próprio).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths: ["Dockerfile", "requirements.txt", "app_web.py", ".github/workflows/docker.yml"]
+  pull_request:
+    paths: ["Dockerfile", "requirements.txt", "app_web.py", ".github/workflows/docker.yml"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Construir a imagem
+        run: docker build -t extrator-apoena .
+
+      - name: Conferir o OCR dentro da imagem
+        run: |
+          docker run --rm extrator-apoena tesseract --version
+          docker run --rm extrator-apoena tesseract --list-langs
+          docker run --rm extrator-apoena python -c "import pytesseract; print('Tesseract visto pelo app:', pytesseract.get_tesseract_version())"
+
+      - name: Conferir se o app responde
+        run: |
+          docker run -d --name extrator -p 8501:8501 extrator-apoena
+          for i in $(seq 1 40); do
+            if curl -sf http://localhost:8501/healthz > /dev/null; then
+              echo "App respondeu em $((i*3))s"; ok=1; break
+            fi
+            sleep 3
+          done
+          docker logs extrator
+          docker rm -f extrator
+          test -n "$ok" || { echo "A imagem não respondeu em http://localhost:8501"; exit 1; }
