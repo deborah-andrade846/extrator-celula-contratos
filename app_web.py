@@ -283,6 +283,45 @@ def extrair_fiscal(arquivo_pdf, usar_ocr: bool):
 # evita capturar códigos ou números soltos da descrição.
 _TOKEN_VALOR_HOTEL = re.compile(r'^\d{1,3}(?:\.\d{3})*[.,]\d{2}$')
 
+# O rótulo do hóspede chega do OCR com trocas típicas (Hospede, H0spede, princ1pal).
+# Exigir a grafia exata fazia o nome se perder e a planilha inteira sair como
+# "NÃO_IDENTIFICADO" — daí a tolerância no acento, no zero por "o" e no um por "i"/"l".
+_RE_HOSPEDE = re.compile(r'h[oó0]spede\s+pr[ilí1]nc[ilí1]pal\s*[:;]?\s*(.+)', re.IGNORECASE)
+
+def _extrair_nome_hospede(linha: str) -> Optional[str]:
+    """Devolve o nome do hóspede na linha, ou None se ela não for a do rótulo."""
+    achado = _RE_HOSPEDE.search(linha)
+    if not achado:
+        return None
+    # O nome termina onde começa o próximo campo da mesma linha (CPF, Empresa...).
+    nome = re.split(r'\||\bCPF\b|\bEMPRESA\b', achado.group(1), flags=re.IGNORECASE)[0]
+    nome = " ".join(nome.split()).strip(" .:-")
+    return nome or None
+
+
+def _identificacao_do_arquivo(nome_arquivo: str) -> str:
+    """Nome do PDF sem a extensão, usado quando o hóspede não é identificado."""
+    return re.sub(r'\.pdf$', '', nome_arquivo, flags=re.IGNORECASE).strip() or nome_arquivo
+
+
+# Correções pontuais de OCR nas descrições. A lista é curta e explícita de propósito:
+# o Tesseract troca Ç por G, mas uma regra genérica G→Ç estragaria palavras legítimas
+# ("GAS" viraria "ÇAS"). Só entram aqui trocas observadas em documentos reais.
+_CORRECOES_DESCRICAO = {
+    "CALGA": "CALÇA",
+    "CALCA": "CALÇA",
+}
+
+# Ruído que o OCR às vezes cola no início da descrição (ex.: "N14 CAMISA"): uma ou duas
+# letras seguidas de poucos dígitos, sem significado no relatório.
+_RE_RUIDO_INICIAL = re.compile(r'^[A-Z]{1,2}\d{1,3}\s+')
+
+def _corrigir_descricao(info: str) -> str:
+    """Limpa ruído do OCR e corrige trocas conhecidas, preservando o resto do texto."""
+    info = _RE_RUIDO_INICIAL.sub('', info.strip())
+    return " ".join(_CORRECOES_DESCRICAO.get(p.upper(), p) for p in info.split())
+
+
 def _normalizar_valor_hotel(valor: str) -> str:
     """Padroniza o separador decimal para vírgula (formato brasileiro)."""
     if valor.count('.') and valor.count(','):
@@ -320,6 +359,7 @@ def limpar_linha_hotel(linha, nome_hospede):
     m_comanda = re.search(r'Comanda\s+([A-Za-z]*\d+)', info_completa, re.IGNORECASE)
     comanda = m_comanda.group(1).upper() if m_comanda else None
     info = re.split(r'\s*-\s*Comanda', info_completa, flags=re.IGNORECASE)[0].strip()
+    info = _corrigir_descricao(info)
     return {
         "Arquivo": nome_hospede,
         "Data": data,
@@ -355,7 +395,10 @@ def _corrigir_datas_por_comanda(dados):
 
 def extrair_hotel(arquivo_pdf, usar_ocr=False):
     dados = []
-    nome_hospede = "NÃO_IDENTIFICADO"
+    # Sem hóspede identificado, a linha ainda precisa dizer de qual PDF veio: com
+    # dezenas de arquivos numa rodada, "NÃO_IDENTIFICADO" deixava a planilha sem origem.
+    identificacao = _identificacao_do_arquivo(arquivo_pdf.name)
+    nome_hospede = None
     with pdfplumber.open(arquivo_pdf) as pdf:
         # 1. Tenta texto direto (rápido)
         texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
@@ -377,18 +420,21 @@ def extrair_hotel(arquivo_pdf, usar_ocr=False):
 
         linhas = texto_completo.split('\n')
         for linha in linhas:
-            if "Hóspede principal:" in linha:
-                try:
-                    nome_cru = linha.split("Hóspede principal:")[1].split("|")[0].strip()
-                    nome_hospede = nome_cru.split()[0]
-                except:
-                    pass
+            nome_na_linha = _extrair_nome_hospede(linha)
+            if nome_na_linha:
+                nome_hospede = nome_na_linha
                 continue
             if any(palavra in linha for palavra in ["PLAZA HOTEL", "Apartamento:", "Fechado", "Pagamentos", "Tarifário:"]):
                 continue
-            linha_extraida = limpar_linha_hotel(linha, nome_hospede)
+            linha_extraida = limpar_linha_hotel(linha, nome_hospede or identificacao)
             if linha_extraida:
                 dados.append(linha_extraida)
+
+    # O rótulo do hóspede aparece no cabeçalho, mas se só for reconhecido depois de
+    # algumas linhas, elas ficariam com a identificação de reserva: uniformiza no fim.
+    if nome_hospede:
+        for linha_dados in dados:
+            linha_dados["Arquivo"] = nome_hospede
     return _corrigir_datas_por_comanda(dados)
 
 # ==================== EXTRAÇÃO EXAMES ====================
@@ -812,8 +858,16 @@ with st.sidebar:
     if 'total_processados' not in st.session_state:
         st.session_state.total_processados = 0
         st.session_state.total_linhas = 0
-    st.metric("📄 PDFs Processados", st.session_state.total_processados)
-    st.metric("📋 Linhas Extraídas", st.session_state.total_linhas)
+    # Espaços reservados: a barra lateral é desenhada antes do processamento, então
+    # sem isso os totais só apareceriam na interação seguinte — e ficavam zerados
+    # justamente na tela em que o usuário acabou de processar os PDFs.
+    _espaco_pdfs, _espaco_linhas = st.empty(), st.empty()
+
+    def atualizar_estatisticas() -> None:
+        _espaco_pdfs.metric("📄 PDFs Processados", st.session_state.total_processados)
+        _espaco_linhas.metric("📋 Linhas Extraídas", st.session_state.total_linhas)
+
+    atualizar_estatisticas()
     st.markdown("---")
 
 tipo = st.radio("1. Tipo de relatório:", 
@@ -904,6 +958,7 @@ if st.button("🚀 Extrair Dados", type="primary"):
 
         st.session_state.total_processados += len(arquivos)
         st.session_state.total_linhas += len(dados_totais)
+        atualizar_estatisticas()
 
         if stats_lista:
             col1, col2, col3 = st.columns(3)
