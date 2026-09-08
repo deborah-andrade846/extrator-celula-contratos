@@ -1,9 +1,10 @@
 streamlit
 pandas
-pdfplumber
+# >=0.11 rasteriza páginas com pypdfium2 (wheel puro), sem poppler/ImageMagick
+pdfplumber>=0.11
+pypdfium2
 xlsxwriter
 openpyxl
 pytesseract
-pdf2image
 opencv-python-headless
 numpy
