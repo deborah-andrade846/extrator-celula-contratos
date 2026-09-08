@@ -18,6 +18,7 @@ from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass, asdict
 import logging
 from contextlib import contextmanager
+from functools import lru_cache
 import gc
 import unicodedata
 
@@ -69,6 +70,31 @@ def converter_para_numero(valor_str):
         return valor_str
 
 # ==================== OCR COM VISÃO COMPUTACIONAL ====================
+# O OCR depende do binário do Tesseract, que é um pacote de sistema (apt) e nem sempre
+# existe no ambiente — a Streamlit Cloud, por exemplo, pode falhar ao instalar pacotes apt.
+# Sem ele o app continua funcionando com a camada de texto dos PDFs (o caminho mais rápido
+# e preciso); só os PDFs digitalizados ficam de fora, com aviso claro na interface.
+MSG_OCR_INDISPONIVEL = (
+    "OCR indisponível neste ambiente (Tesseract não instalado). "
+    "A leitura usa apenas a camada de texto do PDF — PDFs digitalizados (imagem) não serão lidos. "
+    "Para habilitar, instale os pacotes de `apt-packages.txt`."
+)
+
+@lru_cache(maxsize=1)
+def ocr_disponivel() -> bool:
+    """Indica se o binário do Tesseract está instalado (resultado memorizado)."""
+    try:
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        logger.warning("Tesseract não encontrado: OCR desabilitado nesta execução.")
+        return False
+
+def avisar_ocr_indisponivel(contexto: str = "") -> None:
+    """Mostra um aviso único e legível quando o OCR foi pedido mas não há Tesseract."""
+    prefixo = f"{contexto}: " if contexto else ""
+    st.warning(f"⚠️ {prefixo}{MSG_OCR_INDISPONIVEL}")
+
 # Confiança mínima do OSD para aceitar uma rotação. O Tesseract às vezes sugere
 # "girar 180°" para páginas já corretas com confiança ínfima (ex.: 0.01); confiar
 # nesse palpite vira uma página boa de cabeça para baixo e destrói o OCR.
@@ -214,6 +240,10 @@ def extrair_fiscal(arquivo_pdf, usar_ocr: bool):
     dados_locais, rejeitadas = [], []
     stats = EstatisticasProcessamento(arquivo=arquivo_pdf.name)
 
+    if usar_ocr and not ocr_disponivel():
+        avisar_ocr_indisponivel(arquivo_pdf.name)
+        usar_ocr = False
+
     if usar_ocr:
         texto = ler_texto_com_ocr(arquivo_pdf)
     else:
@@ -333,7 +363,9 @@ def extrair_hotel(arquivo_pdf, usar_ocr=False):
         # 2. Aplica OCR de alta precisão se solicitado ou se o texto direto for insuficiente
         #    (PDF escaneado / sem camada de texto legível)
         texto_direto_suficiente = "Hóspede principal:" in texto_completo and texto_completo.strip() != ""
-        if usar_ocr or not texto_direto_suficiente:
+        if (usar_ocr or not texto_direto_suficiente) and not ocr_disponivel():
+            avisar_ocr_indisponivel(arquivo_pdf.name)
+        elif usar_ocr or not texto_direto_suficiente:
             st.info(f"Aplicando OCR de alta precisão em {arquivo_pdf.name}...")
             total_paginas = len(pdf.pages)
             barra = st.progress(0, text="OCR nas diárias...")
@@ -410,7 +442,9 @@ def extrair_refeicoes(arquivo_pdf, usar_ocr=False):
         texto_direto_suficiente = True
 
     # 2. Se necessário, aplica OCR apenas nas páginas relevantes (primeira e última)
-    if usar_ocr or not texto_direto_suficiente:
+    if (usar_ocr or not texto_direto_suficiente) and not ocr_disponivel():
+        avisar_ocr_indisponivel(arquivo_pdf.name)
+    elif usar_ocr or not texto_direto_suficiente:
         st.info(f"Aplicando OCR em {arquivo_pdf.name}...")
         with pdfplumber.open(arquivo_pdf) as pdf:
             indices = list({0, len(pdf.pages) - 1})  # primeira e última (evita duplicar se for 1 página)
@@ -659,7 +693,9 @@ def extrair_refeicoes_por_empresa(arquivo_pdf, usar_ocr=False):
                 _coletar_empresas_da_pagina(rotulos, numeros, tolerancia_linha, ocorrencias)
 
         # OCR quando: sem camada de texto ou a leitura direta não rendeu empresa (fallback).
-        if not ocorrencias:
+        if not ocorrencias and not ocr_disponivel():
+            avisar_ocr_indisponivel(arquivo_pdf.name)
+        elif not ocorrencias:
             rotacao = _detectar_rotacao_documento(pdf)
             total_paginas = len(pdf.pages)
             barra = st.progress(0, text="Lendo empresas do mapa de refeições...")
@@ -804,7 +840,12 @@ modo_abas = st.radio("2. Organização do Excel:", ["unica", "separadas"],
 
 usar_ocr = False
 if tipo in ["fiscal", "refeicoes", "hotel"]:
-    usar_ocr = st.checkbox("🔍 OCR Alta Precisão (recomendado para PDFs escaneados ou com falhas)")
+    if ocr_disponivel():
+        usar_ocr = st.checkbox("🔍 OCR Alta Precisão (recomendado para PDFs escaneados ou com falhas)")
+    else:
+        st.checkbox("🔍 OCR Alta Precisão (indisponível neste ambiente)",
+                    value=False, disabled=True, help=MSG_OCR_INDISPONIVEL)
+        st.info(f"ℹ️ {MSG_OCR_INDISPONIVEL}")
 
 arquivos = st.file_uploader("3. Selecione os PDFs:", type=['pdf'], accept_multiple_files=True)
 
