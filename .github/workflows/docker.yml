@@ -29,9 +29,10 @@ jobs:
       - name: Conferir se o app responde
         run: |
           docker run -d --name extrator -p 8501:8501 extrator-apoena
+          inicio=$SECONDS
           for i in $(seq 1 40); do
             if curl -sf http://localhost:8501/healthz > /dev/null; then
-              echo "App respondeu em $((i*3))s"; ok=1; break
+              echo "App respondeu em $((SECONDS - inicio))s"; ok=1; break
             fi
             sleep 3
           done

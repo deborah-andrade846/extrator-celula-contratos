@@ -59,6 +59,14 @@ jobs:
       - name: Gerar o executável
         run: pyinstaller --noconfirm --clean desktop/extrator.spec
 
+      - name: Conferir que o OCR embutido foi encontrado
+        shell: pwsh
+        run: |
+          # O app degrada em silêncio sem Tesseract: sem esta checagem, um pacote
+          # sem OCR passaria no teste seguinte (que só exige o app no ar).
+          & dist\ExtratorApoena\ExtratorApoena.exe --verificar-ocr
+          if ($LASTEXITCODE -ne 0) { throw "O Tesseract embutido não foi encontrado pelo programa" }
+
       - name: Conferir se o programa sobe e responde
         shell: pwsh
         run: |
