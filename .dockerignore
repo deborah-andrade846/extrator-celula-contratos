@@ -1,0 +1,8 @@
+.git
+.github
+.devcontainer
+desktop
+__pycache__
+*.pyc
+README.md
+apt-packages.txt
