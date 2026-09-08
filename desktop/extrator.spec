@@ -19,9 +19,12 @@ datas = [(str(RAIZ / "app_web.py"), ".")]
 binaries = []
 hiddenimports = ["streamlit.runtime.scriptrunner.magic_funcs"]
 
-# Pacotes cujos dados/estáticos precisam ir junto (o Streamlit serve seu próprio front-end,
-# o pypdfium2 carrega uma biblioteca nativa, o pdfplumber tem tabelas de dados).
-for pacote in ("streamlit", "pdfplumber", "pypdfium2", "pytesseract", "altair"):
+# Pacotes cujos dados/estáticos/binários precisam ir junto: o Streamlit serve seu próprio
+# front-end, o pypdfium2 carrega biblioteca nativa, e numpy/OpenCV/pandas têm extensões em C
+# cujos submódulos os hooks automáticos nem sempre alcançam — foi assim que um pacote saiu
+# com o numpy quebrado ("No module named 'numpy._core._exceptions'").
+for pacote in ("streamlit", "pdfplumber", "pypdfium2", "pytesseract", "altair",
+               "numpy", "cv2", "pandas"):
     d, b, h = collect_all(pacote)
     datas += d
     binaries += b
