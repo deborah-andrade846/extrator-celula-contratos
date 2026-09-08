@@ -38,6 +38,14 @@ def preparar_tesseract() -> None:
         os.environ["TESSDATA_PREFIX"] = str(tessdata)
 
 
+def caminho_do_app() -> Path:
+    """Onde está o app: dentro do pacote ou, ao rodar do código-fonte, ao lado."""
+    app = raiz_recursos() / "app_web.py"
+    if app.exists():
+        return app
+    return Path(__file__).resolve().parent.parent / "app_web.py"
+
+
 def escolher_porta(inicio: int = PORTA_PREFERIDA) -> int:
     """Primeira porta livre a partir de ``inicio`` (evita conflito com outro app)."""
     for porta in range(inicio, inicio + 50):
@@ -59,37 +67,62 @@ def abrir_navegador(porta: int) -> None:
         time.sleep(0.3)
 
 
-def verificar_ocr() -> int:
-    """Modo de diagnóstico (``--verificar-ocr``): confirma que o OCR embutido funciona.
+def verificar_pacote() -> int:
+    """Modo de diagnóstico (``--verificar``): confirma que o pacote está íntegro.
 
-    Existe porque o app degrada em silêncio quando o Tesseract falta — sem esta
-    checagem, um pacote sem OCR subiria normalmente e passaria despercebido.
+    Checa as três coisas que podem quebrar sem alarde num executável empacotado:
+    as bibliotecas nativas (numpy, OpenCV e afins costumam perder arquivos na
+    hora de empacotar), a execução do próprio app, e o OCR embutido. As três
+    falham em silêncio quando testadas só pelo servidor no ar — o Streamlit
+    responde em /healthz sem sequer executar o script do app.
     """
+    falhas = []
+
+    for modulo in ("numpy", "cv2", "pandas", "pdfplumber", "pypdfium2",
+                   "openpyxl", "xlsxwriter", "pytesseract", "streamlit"):
+        try:
+            __import__(modulo)
+        except Exception as erro:
+            falhas.append(f"import de {modulo}: {erro}")
+    if falhas:
+        for falha in falhas:
+            print(f"FALHOU {falha}")
+        return 1
+    print("Bibliotecas: todas importam.")
+
+    app = caminho_do_app()
+    try:
+        from streamlit.testing.v1 import AppTest
+        teste = AppTest.from_file(str(app), default_timeout=180).run()
+        if teste.exception:
+            print(f"FALHOU execução do app: {list(teste.exception)}")
+            return 1
+    except Exception as erro:
+        print(f"FALHOU execução do app: {erro}")
+        return 1
+    print("App: executa sem erro.")
+
     preparar_tesseract()
     try:
         import pytesseract
         versao = pytesseract.get_tesseract_version()
         idiomas = sorted(pytesseract.get_languages())
     except Exception as erro:
-        print(f"OCR indisponível: {erro}")
+        print(f"FALHOU OCR: {erro}")
         return 1
-    print(f"OCR disponível: Tesseract {versao} | idiomas: {', '.join(idiomas)}")
     if "por" not in idiomas:
-        print("Faltou o idioma português (por) no pacote.")
+        print(f"FALHOU OCR: falta o idioma português (encontrados: {idiomas})")
         return 1
+    print(f"OCR: Tesseract {versao} | idiomas: {', '.join(idiomas)}")
     return 0
 
 
 def main() -> int:
-    if "--verificar-ocr" in sys.argv:
-        return verificar_ocr()
+    if "--verificar" in sys.argv:
+        return verificar_pacote()
 
     preparar_tesseract()
-
-    app = raiz_recursos() / "app_web.py"
-    if not app.exists():  # execução a partir do código-fonte
-        app = Path(__file__).resolve().parent.parent / "app_web.py"
-
+    app = caminho_do_app()
     porta = escolher_porta()
     print(f"Extrator Apoena — abrindo em http://localhost:{porta}")
     print("Feche esta janela para encerrar o programa.")
