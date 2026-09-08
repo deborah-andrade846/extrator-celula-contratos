@@ -59,7 +59,31 @@ def abrir_navegador(porta: int) -> None:
         time.sleep(0.3)
 
 
+def verificar_ocr() -> int:
+    """Modo de diagnóstico (``--verificar-ocr``): confirma que o OCR embutido funciona.
+
+    Existe porque o app degrada em silêncio quando o Tesseract falta — sem esta
+    checagem, um pacote sem OCR subiria normalmente e passaria despercebido.
+    """
+    preparar_tesseract()
+    try:
+        import pytesseract
+        versao = pytesseract.get_tesseract_version()
+        idiomas = sorted(pytesseract.get_languages())
+    except Exception as erro:
+        print(f"OCR indisponível: {erro}")
+        return 1
+    print(f"OCR disponível: Tesseract {versao} | idiomas: {', '.join(idiomas)}")
+    if "por" not in idiomas:
+        print("Faltou o idioma português (por) no pacote.")
+        return 1
+    return 0
+
+
 def main() -> int:
+    if "--verificar-ocr" in sys.argv:
+        return verificar_ocr()
+
     preparar_tesseract()
 
     app = raiz_recursos() / "app_web.py"
