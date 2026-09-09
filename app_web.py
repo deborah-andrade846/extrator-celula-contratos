@@ -521,9 +521,64 @@ def _corrigir_datas_por_comanda(dados):
         melhor = max(datas, key=lambda dt: (datas.count(dt), 1 if canonica.match(dt) else 0))
         for l in linhas:
             l["Data"] = melhor
-    for d in dados:
-        d.pop("_comanda", None)
     return dados
+
+
+# Identificador da estadia no cabeçalho ("Global: #18377-51498"). É o que diz que dois
+# PDFs falam da mesma hospedagem, mesmo tendo nomes de arquivo diferentes.
+_RE_RESERVA_HOTEL = re.compile(r'Global\s*[:;]?\s*#?\s*([\w-]+)', re.IGNORECASE)
+
+
+def _reserva_do_texto(texto: str) -> str:
+    """Número da reserva no extrato, ou '' quando o cabeçalho não traz."""
+    achado = _RE_RESERVA_HOTEL.search(texto)
+    return achado.group(1) if achado else ""
+
+
+def _chave_lancamento(registro: Dict) -> tuple:
+    """O que identifica um lançamento dentro de uma estadia."""
+    return (
+        registro.get("_comanda") or "",
+        registro["Data"],
+        registro["Informação adicional"],
+        registro.get("Apartamento", ""),
+        registro["Qtde"],
+        registro["Unidade"],
+        registro["Total"],
+    )
+
+
+def remover_lancamentos_repetidos(dados: List[Dict]) -> Tuple[List[Dict], int]:
+    """Tira o mesmo lançamento contado duas vezes por dois PDFs da mesma estadia.
+
+    O extrato de diárias costuma vir com os consumos junto, e o de consumos repete
+    exatamente esses lançamentos: processar os dois arquivos cobrava o consumo duas
+    vezes. Só descarta o que se repete **entre arquivos diferentes** da mesma reserva —
+    dentro de um arquivo, duas linhas iguais são dois lançamentos de verdade (duas
+    águas no mesmo dia, em comandas diferentes), e todas ficam.
+
+    Devolve os dados sem as repetições e quantas linhas saíram.
+    """
+    from collections import defaultdict
+    por_reserva = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for indice, registro in enumerate(dados):
+        # Sem o número da reserva no cabeçalho, o hóspede serve de agrupador: a comanda
+        # não se repete entre estadias, nem a diária de um mesmo dia e apartamento.
+        reserva = registro.get("_reserva") or registro.get("Arquivo") or ""
+        por_reserva[reserva][_chave_lancamento(registro)][registro.get("_origem")].append(indice)
+
+    manter = set()
+    for chaves in por_reserva.values():
+        for por_origem in chaves.values():
+            # Vale o arquivo que trouxe essa linha mais vezes; empate fica com o
+            # primeiro processado.
+            manter.update(max(por_origem.values(), key=len))
+
+    resultado = [registro for indice, registro in enumerate(dados) if indice in manter]
+    for registro in resultado:
+        for interno in ("_comanda", "_reserva", "_origem"):
+            registro.pop(interno, None)
+    return resultado, len(dados) - len(resultado)
 
 # Linhas do cabeçalho do extrato que nunca são lançamento.
 _CABECALHOS_HOTEL = ["PLAZA HOTEL", "Apartamento:", "Fechado", "Pagamentos", "Tarifário:"]
@@ -575,10 +630,13 @@ def extrair_hotel(arquivo_pdf, usar_ocr=False):
         #    página com fonte problemática já perdeu o extrato inteiro de uma diária:
         #    substituir o texto direto por ele custava as linhas que só a camada de
         #    texto tinha. Em empate vale o texto direto, que não inventa caracteres.
+        texto_ocr = ""
         for i, pagina in enumerate(pdf.pages):
             registros, nome = _lancamentos_do_texto(paginas_texto[i], identificacao)
             if rodar_ocr:
-                registros_ocr, nome_ocr = _lancamentos_do_texto(ocr_pagina(pagina), identificacao)
+                texto_pagina_ocr = ocr_pagina(pagina)
+                texto_ocr += texto_pagina_ocr + "\n"
+                registros_ocr, nome_ocr = _lancamentos_do_texto(texto_pagina_ocr, identificacao)
                 if len(registros_ocr) > len(registros):
                     registros = registros_ocr
                 nome = nome or nome_ocr
@@ -594,6 +652,12 @@ def extrair_hotel(arquivo_pdf, usar_ocr=False):
     if nome_hospede:
         for linha_dados in dados:
             linha_dados["Arquivo"] = nome_hospede
+    # Guarda de que estadia e de que arquivo veio cada linha, para reconhecer depois o
+    # lançamento que dois PDFs da mesma hospedagem trazem repetido.
+    reserva = _reserva_do_texto(texto_completo) or _reserva_do_texto(texto_ocr)
+    for linha_dados in dados:
+        linha_dados["_reserva"] = reserva
+        linha_dados["_origem"] = arquivo_pdf.name
     return _corrigir_datas_por_comanda(dados)
 
 # ==================== EXTRAÇÃO EXAMES ====================
@@ -1154,6 +1218,13 @@ if st.button("🚀 Extrair Dados", type="primary"):
         # O mesmo hóspede costuma chegar em vários PDFs ("FULANO DIARIAS", "FULANO
         # CONSUMO"), e só dá para unificá-lo depois de ler todos.
         if tipo == "hotel" and dados_totais:
+            dados_totais, repetidos = remover_lancamentos_repetidos(dados_totais)
+            if repetidos:
+                st.info(
+                    f"ℹ️ {repetidos} lançamento(s) apareciam em mais de um PDF da mesma "
+                    "reserva (o extrato de diárias costuma repetir os consumos) e foram "
+                    "contados uma vez só."
+                )
             dados_totais = consolidar_hospedes(dados_totais)
 
         if dados_totais:
