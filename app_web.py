@@ -24,7 +24,11 @@ import unicodedata
 
 # ==================== CONFIGURAÇÕES GLOBAIS ====================
 COLUNAS_CONFIG = {
-    "hotel": ["Arquivo", "Data", "Informação adicional", "Qtde", "Unidade", "Total"],
+    # Apartamento e Observação entram depois do Total, de propósito: as seis primeiras
+    # colunas seguem sendo as de sempre, e a tabela dinâmica montada sobre elas continua
+    # valendo.
+    "hotel": ["Arquivo", "Data", "Informação adicional", "Qtde", "Unidade", "Total",
+              "Apartamento", "Observação"],
     "exames": ["Arquivo", "Exame", "Valor"],
     "refeicoes": ["Arquivo", "Data", "Total"],
     "refeicoes_empresas": ["Arquivo", "Empresa", "Total"],
@@ -61,6 +65,10 @@ def gerenciar_memoria(limite_mb: int = 500):
         gc.collect()
 
 # ==================== FUNÇÕES AUXILIARES ====================
+def _sem_acento(texto):
+    return ''.join(c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c))
+
+
 def converter_para_numero(valor_str):
     if not valor_str or valor_str == "N/D":
         return None
@@ -299,9 +307,91 @@ def _extrair_nome_hospede(linha: str) -> Optional[str]:
     return nome or None
 
 
+# Assunto que o nome do arquivo carrega depois do nome da pessoa. Três PDFs do mesmo
+# hóspede ("FULANO DIARIAS", "FULANO CONSUMO", "FULANO LAVANDERIA") viravam três
+# rótulos distintos na planilha, e a dinâmica somava a mesma pessoa em três linhas.
+_RE_ASSUNTO_ARQUIVO = re.compile(
+    r'[\s_-]*\b(?:'
+    r'di[áa]rias?|consumos?|lavanderia|frigobar|hospedagem|extrato|'
+    r'passa[\s_-]*porte(?:[\s_-]*\S+)?|passaporte(?:[\s_-]*\S+)?'
+    r')\b(?:[\s_-]*(?:e|de|do|da))?',
+    re.IGNORECASE,
+)
+
+
 def _identificacao_do_arquivo(nome_arquivo: str) -> str:
-    """Nome do PDF sem a extensão, usado quando o hóspede não é identificado."""
-    return re.sub(r'\.pdf$', '', nome_arquivo, flags=re.IGNORECASE).strip() or nome_arquivo
+    """Nome da pessoa a partir do nome do PDF, quando o hóspede não é identificado."""
+    nome = re.sub(r'\.pdf$', '', nome_arquivo, flags=re.IGNORECASE)
+    nome = nome.replace('_', ' ')
+    # O assunto pode vir repetido ("DIARIA E CONSUMO"): remove todas as ocorrências.
+    limpo = " ".join(_RE_ASSUNTO_ARQUIVO.sub(' ', nome).split()).strip(" .-")
+    # Um arquivo cujo nome é só o assunto ("CONSUMO.pdf") não perde a origem.
+    return limpo or " ".join(nome.split()).strip() or nome_arquivo
+
+
+def _tokens_nome(nome: str) -> List[str]:
+    """Tokens comparáveis de um nome: sem acento, sem pontuação, em caixa alta."""
+    return [t for t in re.split(r'[^0-9A-Za-zÀ-ÿ]+', _sem_acento(nome).upper()) if t]
+
+
+# Partículas que não ajudam a distinguir uma pessoa de outra.
+_PARTICULAS_NOME = {"DE", "DA", "DO", "DAS", "DOS", "E"}
+
+
+def _nome_e_abreviacao(curto: str, longo: str) -> bool:
+    """Diz se ``curto`` é o mesmo nome de ``longo``, escrito de forma mais curta.
+
+    "REGINALDO B. LEITE" é "REGINALDO BATISTA LEITE"; "ARMANDO MARQUES" é "ARMANDO
+    MARQUES DE MELLO FILHO". Exige que cada token do nome curto apareça, em ordem e
+    como início de um token do longo, e que o primeiro token bata por inteiro — sem
+    isso "DANIEL CHAVES" casaria com "DANIEL MONTEIRO MACHADO".
+    """
+    tokens_curto = [t for t in _tokens_nome(curto) if t not in _PARTICULAS_NOME]
+    tokens_longo = [t for t in _tokens_nome(longo) if t not in _PARTICULAS_NOME]
+    if not tokens_curto or len(tokens_curto) > len(tokens_longo):
+        return False
+    # Mesmo número de tokens ainda pode ser abreviação ("REGINALDO B. LEITE" para
+    # "REGINALDO BATISTA LEITE"); aí o desempate é quem escreve mais letras.
+    if len(tokens_curto) == len(tokens_longo):
+        if sum(map(len, tokens_curto)) >= sum(map(len, tokens_longo)):
+            return False
+    if tokens_curto[0] != tokens_longo[0]:
+        return False
+    i = 0
+    for token in tokens_curto:
+        while i < len(tokens_longo) and not tokens_longo[i].startswith(token):
+            i += 1
+        if i == len(tokens_longo):
+            return False
+        i += 1
+    return True
+
+
+def consolidar_hospedes(dados: List[Dict]) -> List[Dict]:
+    """Unifica os rótulos que são a mesma pessoa escrita de formas diferentes.
+
+    O nome tirado do arquivo ("EDUARDO SIMOES") e o lido no extrato ("EDUARDO SIMOES
+    ALBUQUERQUE") são a mesma pessoa; sem juntá-los, cada um vira uma linha da tabela
+    dinâmica. O nome mais completo vence. Um rótulo curto que sirva para duas pessoas
+    diferentes fica como está — melhor um nome curto do que somar quem não deve.
+    """
+    rotulos = {d["Arquivo"] for d in dados if d.get("Arquivo")}
+    equivalente = {}
+    for curto in rotulos:
+        candidatos = [longo for longo in rotulos if _nome_e_abreviacao(curto, longo)]
+        if len(candidatos) == 1:
+            equivalente[curto] = candidatos[0]
+    # "A" -> "A B" -> "A B C": segue a cadeia até o nome mais completo.
+    for curto in list(equivalente):
+        visto = {curto}
+        destino = equivalente[curto]
+        while destino in equivalente and destino not in visto:
+            visto.add(destino)
+            destino = equivalente[destino]
+        equivalente[curto] = destino
+    for d in dados:
+        d["Arquivo"] = equivalente.get(d.get("Arquivo"), d.get("Arquivo"))
+    return dados
 
 
 # Correções pontuais de OCR nas descrições. A lista é curta e explícita de propósito:
@@ -312,14 +402,39 @@ _CORRECOES_DESCRICAO = {
     "CALCA": "CALÇA",
 }
 
-# Ruído que o OCR às vezes cola no início da descrição (ex.: "N14 CAMISA"): uma ou duas
-# letras seguidas de poucos dígitos, sem significado no relatório.
-_RE_RUIDO_INICIAL = re.compile(r'^[A-Z]{1,2}\d{1,3}\s+')
+# Ruído que o OCR às vezes cola no início da descrição: uma ou duas letras seguidas de
+# poucos dígitos ("N14 CAMISA", "N:14 CAMISA") ou um número solto que já está nas
+# colunas de quantidade e valor ("8 MEIAS", "16,50 BERMUDA", "1 AGUA SEM GAS"). Só
+# remove quando ainda sobra texto depois — a descrição nunca é só o número.
+_RE_RUIDO_INICIAL = re.compile(r'^(?:[A-Z]{1,2}[:.]?\d{1,3}|\d{1,3}(?:[.,]\d{1,2})?)\s+(?=\D)')
+
+# Diária: "Apart. 058 (MST2)" e "Apart. 086 1C (LUX2) (No show)". O que interessa na
+# dinâmica é o tipo do apartamento — com o número junto, cada quarto virava uma coluna
+# própria e as 5 categorias de diária viravam 23. Número e ressalva vão para colunas
+# separadas, então nada se perde.
+_RE_DIARIA_HOTEL = re.compile(
+    r'^Apart\.?\s*(?P<apartamento>.*?)\s*\(\s*(?P<tipo>[A-Z]{2,4}\d?)\s*\)\s*(?P<obs>.*)$',
+    re.IGNORECASE,
+)
+
 
 def _corrigir_descricao(info: str) -> str:
     """Limpa ruído do OCR e corrige trocas conhecidas, preservando o resto do texto."""
     info = _RE_RUIDO_INICIAL.sub('', info.strip())
     return " ".join(_CORRECOES_DESCRICAO.get(p.upper(), p) for p in info.split())
+
+
+def _separar_diaria(info: str) -> Tuple[str, str, str]:
+    """Devolve (descrição, apartamento, observação) de uma linha de diária.
+
+    Numa linha que não é diária, a descrição volta em caixa alta e as outras duas
+    vazias: "jaqueta" e "JAQUETA" são o mesmo item e precisam somar juntos.
+    """
+    achado = _RE_DIARIA_HOTEL.match(info)
+    if not achado:
+        return info.upper(), "", ""
+    obs = achado.group("obs").strip(" ()")
+    return achado.group("tipo").upper(), achado.group("apartamento").strip(), obs
 
 
 # Data que abre a linha de lançamento. O ano de 4 dígitos só é aceito quando começa
@@ -329,13 +444,20 @@ def _corrigir_descricao(info: str) -> str:
 _RE_DATA_HOTEL = re.compile(r'^(\d{1,2}/\d{1,2}/(?:(?:19|20)\d{2}|\d{2}))')
 
 
-def _normalizar_valor_hotel(valor: str) -> str:
-    """Padroniza o separador decimal para vírgula (formato brasileiro)."""
-    if valor.count('.') and valor.count(','):
-        # Ex.: 1.234,56 -> mantém
-        return valor
-    # Ex.: 15.00 (OCR leu ponto) -> 15,00
-    return valor.replace('.', ',') if valor.count('.') == 1 and ',' not in valor else valor
+def _normalizar_valor_hotel(valor: str) -> float:
+    """Converte o token do extrato em número, para a planilha somar sem retrabalho.
+
+    Saía como texto ("220,00"), e texto o Excel não soma: a tabela dinâmica dava zero
+    até alguém converter coluna por coluna. Aceita o formato brasileiro (1.234,56) e o
+    ponto decimal que o OCR às vezes devolve (15.00).
+    """
+    valor = valor.strip()
+    if ',' in valor:
+        valor = valor.replace('.', '').replace(',', '.')
+    try:
+        return float(valor)
+    except ValueError:
+        return 0.0
 
 def limpar_linha_hotel(linha, nome_hospede):
     linha = linha.strip()
@@ -367,13 +489,16 @@ def limpar_linha_hotel(linha, nome_hospede):
     comanda = m_comanda.group(1).upper() if m_comanda else None
     info = re.split(r'\s*-\s*Comanda', info_completa, flags=re.IGNORECASE)[0].strip()
     info = _corrigir_descricao(info)
+    descricao, apartamento, observacao = _separar_diaria(info)
     return {
         "Arquivo": nome_hospede,
         "Data": data,
-        "Informação adicional": info,
+        "Informação adicional": descricao,
         "Qtde": _normalizar_valor_hotel(numericos[0]),
         "Unidade": _normalizar_valor_hotel(numericos[1]),
         "Total": _normalizar_valor_hotel(numericos[-1]),
+        "Apartamento": apartamento,
+        "Observação": observacao,
         "_comanda": comanda
     }
 
@@ -607,9 +732,6 @@ _LIXO_KEYWORDS = (
     'gerencial de refeicoes', 'periodo:', 'pagina', 'usuario', 'relatorio de mapa',
 )
 
-def _sem_acento(texto):
-    return ''.join(c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c))
-
 def _linha_de_rodape(texto):
     """True para linhas de rodapé/cabeçalho (não são empresas)."""
     t = _sem_acento(texto).lower()
@@ -826,6 +948,10 @@ def gerar_excel_formatado(df_principal, df_erros, tipo_relatorio, modo_abas):
             ws.append(list(row))
             for cell in ws[r_idx]:
                 cell.font = Font(name="Arial", size=10)
+                # Quantidade e valor saem como número; o formato só escolhe como
+                # aparecem, sem devolvê-los a texto.
+                if isinstance(cell.value, float):
+                    cell.number_format = "#,##0.00"
         ws.freeze_panes = "A2"
 
     if modo_abas == "unica" or df_principal.empty:
@@ -1024,6 +1150,11 @@ if st.button("🚀 Extrair Dados", type="primary"):
 
         # Quando o mapa de refeições é detalhado por empresa, o layout de saída muda.
         tipo_saida = "refeicoes_empresas" if (tipo == "refeicoes" and sub_refeicoes == "empresa") else tipo
+
+        # O mesmo hóspede costuma chegar em vários PDFs ("FULANO DIARIAS", "FULANO
+        # CONSUMO"), e só dá para unificá-lo depois de ler todos.
+        if tipo == "hotel" and dados_totais:
+            dados_totais = consolidar_hospedes(dados_totais)
 
         if dados_totais:
             df = pd.DataFrame(dados_totais, columns=COLUNAS_CONFIG[tipo_saida])
