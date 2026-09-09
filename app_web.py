@@ -459,6 +459,40 @@ def _normalizar_valor_hotel(valor: str) -> float:
     except ValueError:
         return 0.0
 
+def _fecha(valor: float, referencia: float, tolerancia: float = 0.01) -> bool:
+    """Compara dois valores em reais, tolerando o arredondamento de centavos."""
+    return abs(valor - referencia) <= tolerancia
+
+
+def _quantidade_e_unitario(valores: List[float]) -> Tuple[float, float, bool]:
+    """Separa Qtde e Unidade entre os números da linha, conferindo pela aritmética.
+
+    A linha traz Qtde, Unidade, Bruto, Desc., Taxas e Total, e Qtde × Unidade tem de
+    fechar com o Bruto. Quando o OCR perde a coluna Qtde, os números escorregam uma
+    casa e o valor unitário vai para a quantidade: "CALÇA 2,00 8,00 16,00" lido sem o
+    "2,00" virava quantidade 8 de um item de R$ 16,00. A conta desfaz o engano — o
+    unitário divide o total e devolve a quantidade que o documento tinha.
+
+    Devolve (qtde, unitário, conferido).
+    """
+    total = valores[-1]
+    qtde, unitario = valores[0], valores[1]
+    # Caminho normal: o produto fecha com o Bruto (ou com o Total, quando não há
+    # desconto nem taxa — o caso de todo lançamento destes extratos).
+    referencias = [total]
+    if len(valores) >= 4:
+        referencias.append(valores[2])
+    if any(_fecha(qtde * unitario, referencia) for referencia in referencias):
+        return qtde, unitario, True
+    # Colunas escorregadas: o primeiro número é o valor unitário. A quantidade só é
+    # aceita se for inteira e plausível — senão nada é inventado.
+    if unitario > 0 and total > 0:
+        candidata = total / qtde if qtde > 0 else 0
+        if qtde > 0 and _fecha(candidata, round(candidata)) and 1 <= round(candidata) <= 999:
+            return float(round(candidata)), qtde, True
+    return qtde, unitario, False
+
+
 def limpar_linha_hotel(linha, nome_hospede):
     linha = linha.strip()
     # 1. A linha precisa começar por uma data. O dia/mês podem vir com 1 dígito
@@ -472,7 +506,7 @@ def limpar_linha_hotel(linha, nome_hospede):
     # 2. Remove um horário opcional logo após a data. Aceita HH:MM / HH:MM:SS e
     #    também formas em que o OCR perdeu o separador ou trocou por ponto
     #    (ex.: "1412", "0915", "10.11").
-    resto = re.sub(r'^\d{1,2}[:.]?\d{2}(?::\d{2})?\s*', '', resto)
+    resto, hora_lida = re.subn(r'^\d{1,2}[:.]?\d{2}(?::\d{2})?\s*', '', resto)
     partes = resto.split()
     # 3. Coleta os tokens numéricos finais (Qtde Unidade Bruto Desc. Taxas Total)
     numericos = []
@@ -490,16 +524,25 @@ def limpar_linha_hotel(linha, nome_hospede):
     info = re.split(r'\s*-\s*Comanda', info_completa, flags=re.IGNORECASE)[0].strip()
     info = _corrigir_descricao(info)
     descricao, apartamento, observacao = _separar_diaria(info)
+    valores = [_normalizar_valor_hotel(n) for n in numericos]
+    qtde, unitario, conferido = _quantidade_e_unitario(valores)
+    if not conferido:
+        # A conta não fecha e não dá para reconstruí-la: a linha entra como foi lida,
+        # marcada, porque numa conferência de valores um número errado calado é pior
+        # do que um número duvidoso apontado.
+        observacao = " - ".join(filter(None, [observacao, "Conferir quantidade"]))
     return {
         "Arquivo": nome_hospede,
         "Data": data,
         "Informação adicional": descricao,
-        "Qtde": _normalizar_valor_hotel(numericos[0]),
-        "Unidade": _normalizar_valor_hotel(numericos[1]),
-        "Total": _normalizar_valor_hotel(numericos[-1]),
+        "Qtde": qtde,
+        "Unidade": unitario,
+        "Total": valores[-1],
         "Apartamento": apartamento,
         "Observação": observacao,
-        "_comanda": comanda
+        "_comanda": comanda,
+        "_info": info,
+        "_sem_hora": not hora_lida,
     }
 
 def _corrigir_datas_por_comanda(dados):
@@ -521,7 +564,38 @@ def _corrigir_datas_por_comanda(dados):
         melhor = max(datas, key=lambda dt: (datas.count(dt), 1 if canonica.match(dt) else 0))
         for l in linhas:
             l["Data"] = melhor
+    _descolar_hora_da_descricao(grupos)
     return dados
+
+
+# A hora mal lida entra na descrição como um token curto: "11:18" virou "NIB" em
+# "NIB PECAS INTIMA". Mais que isso já é palavra, não hora.
+_LIMITE_TOKEN_HORA = 5
+
+
+def _descolar_hora_da_descricao(grupos):
+    """Tira da descrição o token que era a hora e o OCR não soube ler.
+
+    Toda linha do extrato traz hora depois da data. Quando as outras linhas da mesma
+    Comanda tiveram a hora reconhecida e esta não, o primeiro token da descrição é
+    essa hora ilegível — e sem isso "PECAS INTIMA" virava "NIB PECAS INTIMA", uma
+    categoria a mais na planilha. Só age com a Comanda como testemunha: numa linha
+    solta, o token fica onde está.
+    """
+    for linhas in grupos.values():
+        if not any(not l["_sem_hora"] for l in linhas):
+            continue
+        for linha in linhas:
+            if not linha["_sem_hora"]:
+                continue
+            tokens = linha["_info"].split()
+            if len(tokens) < 2 or len(tokens[0]) > _LIMITE_TOKEN_HORA:
+                continue
+            info = " ".join(tokens[1:])
+            linha["_info"] = info
+            linha["Informação adicional"], linha["Apartamento"], observacao = _separar_diaria(info)
+            if observacao:
+                linha["Observação"] = " - ".join(filter(None, [observacao, linha["Observação"]]))
 
 
 # Identificador da estadia no cabeçalho ("Global: #18377-51498"). É o que diz que dois
@@ -576,7 +650,7 @@ def remover_lancamentos_repetidos(dados: List[Dict]) -> Tuple[List[Dict], int]:
 
     resultado = [registro for indice, registro in enumerate(dados) if indice in manter]
     for registro in resultado:
-        for interno in ("_comanda", "_reserva", "_origem"):
+        for interno in ("_comanda", "_reserva", "_origem", "_info", "_sem_hora"):
             registro.pop(interno, None)
     return resultado, len(dados) - len(resultado)
 
