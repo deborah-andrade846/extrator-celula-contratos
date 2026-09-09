@@ -322,6 +322,13 @@ def _corrigir_descricao(info: str) -> str:
     return " ".join(_CORRECOES_DESCRICAO.get(p.upper(), p) for p in info.split())
 
 
+# Data que abre a linha de lançamento. O ano de 4 dígitos só é aceito quando começa
+# por 19/20: sem essa trava, o "\d{2,4}" engolia a hora colada pelo OCR e a data saía
+# como "24/08/2617" (de "24/08/26 17:23"). A alternativa de 2 dígitos vem depois, para
+# que "24/08/2026" continue casando por inteiro.
+_RE_DATA_HOTEL = re.compile(r'^(\d{1,2}/\d{1,2}/(?:(?:19|20)\d{2}|\d{2}))')
+
+
 def _normalizar_valor_hotel(valor: str) -> str:
     """Padroniza o separador decimal para vírgula (formato brasileiro)."""
     if valor.count('.') and valor.count(','):
@@ -335,7 +342,7 @@ def limpar_linha_hotel(linha, nome_hospede):
     # 1. A linha precisa começar por uma data. O dia/mês podem vir com 1 dígito
     #    porque o OCR às vezes perde um algarismo (ex.: lê "1/06/26" em vez de
     #    "11/06/26"); sem isso a linha seria descartada.
-    match = re.match(r'^(\d{1,2}/\d{1,2}/\d{2,4})\b', linha)
+    match = _RE_DATA_HOTEL.match(linha)
     if not match:
         return None
     data = match.group(1)
@@ -393,6 +400,27 @@ def _corrigir_datas_por_comanda(dados):
         d.pop("_comanda", None)
     return dados
 
+# Linhas do cabeçalho do extrato que nunca são lançamento.
+_CABECALHOS_HOTEL = ["PLAZA HOTEL", "Apartamento:", "Fechado", "Pagamentos", "Tarifário:"]
+
+
+def _lancamentos_do_texto(texto, identificacao):
+    """Lê um bloco de texto (direto ou de OCR) e devolve (lançamentos, hóspede)."""
+    registros = []
+    nome_hospede = None
+    for linha in texto.split('\n'):
+        nome_na_linha = _extrair_nome_hospede(linha)
+        if nome_na_linha:
+            nome_hospede = nome_na_linha
+            continue
+        if any(palavra in linha for palavra in _CABECALHOS_HOTEL):
+            continue
+        linha_extraida = limpar_linha_hotel(linha, nome_hospede or identificacao)
+        if linha_extraida:
+            registros.append(linha_extraida)
+    return registros, nome_hospede
+
+
 def extrair_hotel(arquivo_pdf, usar_ocr=False):
     dados = []
     # Sem hóspede identificado, a linha ainda precisa dizer de qual PDF veio: com
@@ -401,34 +429,40 @@ def extrair_hotel(arquivo_pdf, usar_ocr=False):
     nome_hospede = None
     with pdfplumber.open(arquivo_pdf) as pdf:
         # 1. Tenta texto direto (rápido)
-        texto_completo = "\n".join([pagina.extract_text() or "" for pagina in pdf.pages])
+        paginas_texto = [pagina.extract_text() or "" for pagina in pdf.pages]
+        texto_completo = "\n".join(paginas_texto)
 
         # 2. Aplica OCR de alta precisão se solicitado ou se o texto direto for insuficiente
         #    (PDF escaneado / sem camada de texto legível)
         texto_direto_suficiente = "Hóspede principal:" in texto_completo and texto_completo.strip() != ""
-        if (usar_ocr or not texto_direto_suficiente) and not ocr_disponivel():
+        rodar_ocr = usar_ocr or not texto_direto_suficiente
+        if rodar_ocr and not ocr_disponivel():
             avisar_ocr_indisponivel(arquivo_pdf.name)
-        elif usar_ocr or not texto_direto_suficiente:
-            st.info(f"Aplicando OCR de alta precisão em {arquivo_pdf.name}...")
-            total_paginas = len(pdf.pages)
-            barra = st.progress(0, text="OCR nas diárias...")
-            texto_completo = ""
-            for i, pagina in enumerate(pdf.pages):
-                texto_completo += ocr_pagina(pagina) + "\n"
-                barra.progress((i + 1) / total_paginas, text=f"OCR: Página {i+1} de {total_paginas}")
-            barra.empty()
+            rodar_ocr = False
 
-        linhas = texto_completo.split('\n')
-        for linha in linhas:
-            nome_na_linha = _extrair_nome_hospede(linha)
-            if nome_na_linha:
-                nome_hospede = nome_na_linha
-                continue
-            if any(palavra in linha for palavra in ["PLAZA HOTEL", "Apartamento:", "Fechado", "Pagamentos", "Tarifário:"]):
-                continue
-            linha_extraida = limpar_linha_hotel(linha, nome_hospede or identificacao)
-            if linha_extraida:
-                dados.append(linha_extraida)
+        total_paginas = len(pdf.pages)
+        barra = None
+        if rodar_ocr:
+            st.info(f"Aplicando OCR de alta precisão em {arquivo_pdf.name}...")
+            barra = st.progress(0, text="OCR nas diárias...")
+
+        # 3. Página a página, fica a leitura que rendeu mais lançamentos. O OCR de uma
+        #    página com fonte problemática já perdeu o extrato inteiro de uma diária:
+        #    substituir o texto direto por ele custava as linhas que só a camada de
+        #    texto tinha. Em empate vale o texto direto, que não inventa caracteres.
+        for i, pagina in enumerate(pdf.pages):
+            registros, nome = _lancamentos_do_texto(paginas_texto[i], identificacao)
+            if rodar_ocr:
+                registros_ocr, nome_ocr = _lancamentos_do_texto(ocr_pagina(pagina), identificacao)
+                if len(registros_ocr) > len(registros):
+                    registros = registros_ocr
+                nome = nome or nome_ocr
+                barra.progress((i + 1) / total_paginas, text=f"OCR: Página {i+1} de {total_paginas}")
+            nome_hospede = nome_hospede or nome
+            dados.extend(registros)
+
+        if barra is not None:
+            barra.empty()
 
     # O rótulo do hóspede aparece no cabeçalho, mas se só for reconhecido depois de
     # algumas linhas, elas ficariam com a identificação de reserva: uniformiza no fim.
