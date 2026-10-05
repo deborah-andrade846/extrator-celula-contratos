@@ -180,9 +180,14 @@ def _detectar_rotacao_documento(pdf, amostras=5):
             pass
     return max(votos, key=votos.get) if votos else 0
 
-def ocr_pagina(pagina) -> str:
-    """Aplica Visão Computacional + OCR de alta precisão numa única página do pdfplumber."""
-    return pytesseract.image_to_string(_preparar_imagem_ocr(pagina), lang='por+eng', config='--psm 6 --oem 3')
+def ocr_pagina(pagina, rotacao=None) -> str:
+    """Aplica Visão Computacional + OCR de alta precisão numa única página do pdfplumber.
+
+    Sem ``rotacao``, a orientação é decidida pelo OSD. Passar ``0`` lê a página como
+    ela está, útil para reler quando o palpite do OSD estragou a leitura.
+    """
+    return pytesseract.image_to_string(_preparar_imagem_ocr(pagina, rotacao=rotacao),
+                                       lang='por+eng', config='--psm 6 --oem 3')
 
 def ler_texto_com_ocr(arquivo_pdf):
     texto_completo = ""
@@ -709,8 +714,18 @@ def extrair_hotel(arquivo_pdf, usar_ocr=False):
             registros, nome = _lancamentos_do_texto(paginas_texto[i], identificacao)
             if rodar_ocr:
                 texto_pagina_ocr = ocr_pagina(pagina)
-                texto_ocr += texto_pagina_ocr + "\n"
                 registros_ocr, nome_ocr = _lancamentos_do_texto(texto_pagina_ocr, identificacao)
+                if not registros_ocr:
+                    # O OSD às vezes manda girar 180° uma página que já está de pé, e
+                    # então o OCR devolve o extrato inteiro ao contrário ("Total BRL"
+                    # vira "mada IejoL") e nada é reconhecido. Antes de desistir da
+                    # página, relê na orientação em que ela veio.
+                    texto_original = ocr_pagina(pagina, rotacao=0)
+                    registros_original, nome_original = _lancamentos_do_texto(texto_original, identificacao)
+                    if registros_original:
+                        texto_pagina_ocr = texto_original
+                        registros_ocr, nome_ocr = registros_original, nome_original
+                texto_ocr += texto_pagina_ocr + "\n"
                 if len(registros_ocr) > len(registros):
                     registros = registros_ocr
                 nome = nome or nome_ocr
