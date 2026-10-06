@@ -466,6 +466,34 @@ def _normalizar_valor_hotel(valor: str) -> float:
     except ValueError:
         return 0.0
 
+# Valor cuja vírgula o OCR comeu: "1,00" vira "100" e "10,00" vira "1000". Os dois
+# últimos algarismos são sempre os centavos, e é por isso que se exigem pelo menos
+# três: com menos, o token seria quantidade solta ou ruído, não dinheiro.
+_TOKEN_VALOR_SEM_VIRGULA = re.compile(r'^\d{3,}$')
+
+
+# A linha do extrato tem seis colunas numéricas: Qtde, Unidade, Bruto, Desc., Taxas e
+# Total. Parar nelas evita que a leitura siga para trás e recolha como valor um pedaço
+# da descrição — a comanda que perdeu a letra ("A46521" lido "446521"), por exemplo.
+_COLUNAS_NUMERICAS_HOTEL = 6
+
+
+def _valores_do_fim(partes: List[str], tolerante: bool) -> Tuple[int, List[float]]:
+    """Lê os números do fim da linha. Devolve onde a descrição termina e os valores."""
+    valores: List[float] = []
+    i = len(partes) - 1
+    while i >= 0 and len(valores) < _COLUNAS_NUMERICAS_HOTEL:
+        token = partes[i]
+        if _TOKEN_VALOR_HOTEL.match(token):
+            valores.insert(0, _normalizar_valor_hotel(token))
+        elif tolerante and _TOKEN_VALOR_SEM_VIRGULA.match(token):
+            valores.insert(0, int(token) / 100)
+        else:
+            break
+        i -= 1
+    return i, valores
+
+
 def _fecha(valor: float, referencia: float, tolerancia: float = 0.01) -> bool:
     """Compara dois valores em reais, tolerando o arredondamento de centavos."""
     return abs(valor - referencia) <= tolerancia
@@ -569,14 +597,19 @@ def limpar_linha_hotel(linha, nome_hospede):
     #    (ex.: "1412", "0915", "10.11").
     resto, hora_lida = re.subn(r'^\d{1,2}[:.]?\d{2}(?::\d{2})?\s*', '', resto)
     partes = resto.split()
-    # 3. Coleta os tokens numéricos finais (Qtde Unidade Bruto Desc. Taxas Total)
-    numericos = []
-    i = len(partes) - 1
-    while i >= 0 and _TOKEN_VALOR_HOTEL.match(partes[i]):
-        numericos.insert(0, partes[i])
-        i -= 1
+    # 3. Coleta os tokens numéricos finais (Qtde Unidade Bruto Desc. Taxas Total).
+    #    O OCR às vezes come a vírgula e devolve "100" no lugar de "1,00". Quando isso
+    #    acontece com a linha toda, nenhum número é reconhecido e o lançamento some da
+    #    planilha; quando acontece com um só, ele sobra na descrição. A leitura
+    #    tolerante só prevalece se render mais números E a conta deles fechar — um
+    #    palpite que não fecha não entra.
+    i, valores = _valores_do_fim(partes, tolerante=False)
+    i_tolerante, valores_tolerantes = _valores_do_fim(partes, tolerante=True)
+    if (len(valores_tolerantes) > len(valores) and len(valores_tolerantes) >= 3
+            and _quantidade_e_unitario(valores_tolerantes)[2]):
+        i, valores = i_tolerante, valores_tolerantes
     # Precisa ao menos de Qtde, Unidade e Total para ser uma linha de consumo/diária
-    if len(numericos) < 3:
+    if len(valores) < 3:
         return None
     # 4. Monta a informação adicional (tudo antes dos números) e captura a Comanda
     info_completa = " ".join(partes[:i + 1]).replace("|", "-").strip()
@@ -585,7 +618,6 @@ def limpar_linha_hotel(linha, nome_hospede):
     info = re.split(r'\s*-\s*Comanda', info_completa, flags=re.IGNORECASE)[0].strip()
     info = _corrigir_descricao(info)
     descricao, apartamento, observacao = _separar_diaria(info)
-    valores = [_normalizar_valor_hotel(n) for n in numericos]
     qtde, unitario, conferido = _quantidade_e_unitario(valores)
     return {
         "Arquivo": nome_hospede,
