@@ -482,20 +482,74 @@ def _quantidade_e_unitario(valores: List[float]) -> Tuple[float, float, bool]:
     """
     total = valores[-1]
     qtde, unitario = valores[0], valores[1]
+    # Linha legitimamente zerada (cortesia): não há o que reconstruir.
+    if total == 0 and qtde * unitario == 0:
+        return qtde, unitario, True
     # Caminho normal: o produto fecha com o Bruto (ou com o Total, quando não há
-    # desconto nem taxa — o caso de todo lançamento destes extratos).
+    # desconto nem taxa — o caso de todo lançamento destes extratos). Uma referência
+    # zerada fecha com qualquer coisa multiplicada por zero, e um fator zerado fecha
+    # com ela: nenhum dos dois prova nada, e aceitá-los deixava passar a linha em que
+    # o OCR perdeu Qtde e Unidade de uma vez — o Bruto caía na quantidade e a unidade
+    # saía 0,00 na planilha.
     referencias = [total]
     if len(valores) >= 4:
         referencias.append(valores[2])
-    if any(_fecha(qtde * unitario, referencia) for referencia in referencias):
-        return qtde, unitario, True
-    # Colunas escorregadas: o primeiro número é o valor unitário. A quantidade só é
-    # aceita se for inteira e plausível — senão nada é inventado.
-    if unitario > 0 and total > 0:
-        candidata = total / qtde if qtde > 0 else 0
-        if qtde > 0 and _fecha(candidata, round(candidata)) and 1 <= round(candidata) <= 999:
+    if qtde > 0 and unitario > 0:
+        if any(_fecha(qtde * unitario, ref) for ref in referencias if ref > 0):
+            return qtde, unitario, True
+    # Só a coluna Qtde se perdeu: o primeiro número é o valor unitário, e a
+    # quantidade sai da divisão do total por ele. Aceita apenas inteiro plausível.
+    # O segundo número precisa existir — com ele zerado não houve escorregamento de
+    # uma casa e sim a perda de Qtde e Unidade juntas, e aí a linha sozinha não
+    # distingue "8 meias de R$ 5,00" de "1 meia de R$ 40,00": isso fica para
+    # ``reparar_quantidades``, que conhece o preço do item.
+    if qtde > 0 and unitario > 0 and total > 0:
+        candidata = total / qtde
+        if _fecha(candidata, round(candidata)) and 1 <= round(candidata) <= 999:
             return float(round(candidata)), qtde, True
     return qtde, unitario, False
+
+
+# Texto que marca a linha cuja conta não fecha, na coluna Observação.
+_MARCA_CONFERIR = "Conferir quantidade"
+
+
+def reparar_quantidades(dados: List[Dict]) -> List[Dict]:
+    """Repõe Qtde e Unidade das linhas que a aritmética não confirmou.
+
+    Quando o OCR perde as colunas Qtde e Unidade de uma vez, sobram Bruto, Desc.,
+    Taxas e Total, e não há na própria linha como separar "8 meias de R$ 5,00" de
+    "1 meia de R$ 40,00". Mas o valor unitário de cada item é o mesmo no extrato
+    inteiro — AGUA SEM GAS a R$ 5,00, CALÇA a R$ 8,00 —, então as linhas que a conta
+    confirmou dizem quanto custa a peça, e o total dividido por esse preço devolve a
+    quantidade que o documento tinha.
+
+    Só repõe quando o item aparece com um único preço e a divisão dá inteiro
+    plausível. O que sobrar continua marcado para conferência, com os números como
+    foram lidos: numa conferência de valores, um número errado calado é pior do que
+    um número duvidoso apontado.
+    """
+    from collections import defaultdict
+    precos = defaultdict(set)
+    for registro in dados:
+        if registro.get("_conferido") and registro["Unidade"] > 0:
+            precos[registro["Informação adicional"]].add(registro["Unidade"])
+
+    for registro in dados:
+        if not registro.get("_conferido"):
+            candidatos = precos.get(registro["Informação adicional"], set())
+            if len(candidatos) == 1:
+                unitario = next(iter(candidatos))
+                qtde = registro["Total"] / unitario if unitario else 0
+                if _fecha(qtde, round(qtde)) and 1 <= round(qtde) <= 999:
+                    registro["Qtde"] = float(round(qtde))
+                    registro["Unidade"] = unitario
+                    registro["_conferido"] = True
+        marcas = [m for m in registro["Observação"].split(" - ") if m and m != _MARCA_CONFERIR]
+        if not registro.get("_conferido"):
+            marcas.append(_MARCA_CONFERIR)
+        registro["Observação"] = " - ".join(marcas)
+    return dados
 
 
 def limpar_linha_hotel(linha, nome_hospede):
@@ -531,11 +585,6 @@ def limpar_linha_hotel(linha, nome_hospede):
     descricao, apartamento, observacao = _separar_diaria(info)
     valores = [_normalizar_valor_hotel(n) for n in numericos]
     qtde, unitario, conferido = _quantidade_e_unitario(valores)
-    if not conferido:
-        # A conta não fecha e não dá para reconstruí-la: a linha entra como foi lida,
-        # marcada, porque numa conferência de valores um número errado calado é pior
-        # do que um número duvidoso apontado.
-        observacao = " - ".join(filter(None, [observacao, "Conferir quantidade"]))
     return {
         "Arquivo": nome_hospede,
         "Data": data,
@@ -548,6 +597,7 @@ def limpar_linha_hotel(linha, nome_hospede):
         "_comanda": comanda,
         "_info": info,
         "_sem_hora": not hora_lida,
+        "_conferido": conferido,
     }
 
 def _corrigir_datas_por_comanda(dados):
@@ -655,7 +705,7 @@ def remover_lancamentos_repetidos(dados: List[Dict]) -> Tuple[List[Dict], int]:
 
     resultado = [registro for indice, registro in enumerate(dados) if indice in manter]
     for registro in resultado:
-        for interno in ("_comanda", "_reserva", "_origem", "_info", "_sem_hora"):
+        for interno in ("_comanda", "_reserva", "_origem", "_info", "_sem_hora", "_conferido"):
             registro.pop(interno, None)
     return resultado, len(dados) - len(resultado)
 
@@ -747,7 +797,7 @@ def extrair_hotel(arquivo_pdf, usar_ocr=False):
     for linha_dados in dados:
         linha_dados["_reserva"] = reserva
         linha_dados["_origem"] = arquivo_pdf.name
-    return _corrigir_datas_por_comanda(dados)
+    return reparar_quantidades(_corrigir_datas_por_comanda(dados))
 
 # ==================== EXTRAÇÃO EXAMES ====================
 def extrair_exames(arquivo_pdf):
@@ -1307,6 +1357,9 @@ if st.button("🚀 Extrair Dados", type="primary"):
         # O mesmo hóspede costuma chegar em vários PDFs ("FULANO DIARIAS", "FULANO
         # CONSUMO"), e só dá para unificá-lo depois de ler todos.
         if tipo == "hotel" and dados_totais:
+            # O preço de cada item é o mesmo em todos os extratos, então a rodada
+            # inteira ajuda a repor o que um documento sozinho não explicava.
+            dados_totais = reparar_quantidades(dados_totais)
             dados_totais, repetidos = remover_lancamentos_repetidos(dados_totais)
             if repetidos:
                 st.info(
