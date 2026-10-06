@@ -708,6 +708,16 @@ def _em_reais(valor: float) -> str:
     return "R$ " + f"{valor:,.2f}".translate(str.maketrans(",.", ".,"))
 
 
+def _sem_cifrao_de_formula(texto: str) -> str:
+    """Escapa o cifrão para o Streamlit não ler o trecho como fórmula matemática.
+
+    O markdown do Streamlit trata "$...$" como LaTeX, então "R$ 15,00 e foram
+    extraídos R$ 5,00" aparecia na tela como "R 15,00 e foram extraídos R" em fonte de
+    fórmula, comendo os cifrões e o espaçamento no meio do aviso.
+    """
+    return texto.replace("$", r"\$")
+
+
 def _total_do_documento(texto: str) -> Optional[float]:
     """Valor do "Sub-total" do extrato, ou None quando a leitura não o encontrou."""
     achado = _RE_SUBTOTAL_HOTEL.search(texto)
@@ -728,11 +738,46 @@ def _conferir_com_o_documento(dados: List[Dict], texto: str, arquivo: str) -> No
     extraido = sum(registro["Total"] for registro in dados)
     if _fecha(extraido, esperado):
         return
-    st.warning(
+    aviso = (
         f"⚠️ {arquivo}: o extrato fecha em {_em_reais(esperado)} e foram extraídos "
         f"{_em_reais(extraido)} — diferença de {_em_reais(abs(esperado - extraido))}. "
         "Confira o documento: alguma linha pode não ter sido lida."
     )
+    perdidas = _linhas_nao_aproveitadas(texto)
+    if perdidas:
+        # Mostrar o que a leitura descartou transforma "falta dinheiro" em "falta esta
+        # linha, lida assim" — é com isso que o defeito do OCR vira conserto.
+        aviso += "\n\nLinhas que começam por data e não viraram lançamento:\n" + "\n".join(
+            f"- `{linha}`" for linha in perdidas
+        )
+    st.warning(_sem_cifrao_de_formula(aviso))
+
+
+# Quantas linhas descartadas mostrar: o suficiente para reconhecer o padrão do erro,
+# sem transformar o aviso num despejo de texto.
+_MAX_LINHAS_PERDIDAS = 5
+
+# Crédito e pagamento também abrem com data, mas ficam de fora da extração de
+# propósito — são a contrapartida do faturamento, e listá-los como linha perdida
+# mandaria o usuário procurar defeito onde não há. O sinal é o valor negativo.
+_RE_VALOR_NEGATIVO = re.compile(r'-\s?\d+[.,]\d{2}')
+
+
+def _linhas_nao_aproveitadas(texto: str) -> List[str]:
+    """Linhas que parecem lançamento (começam por data) e a leitura não aproveitou."""
+    perdidas = []
+    for linha in dict.fromkeys(texto.split("\n")):
+        linha = linha.strip()
+        if not _RE_DATA_HOTEL.match(linha) or limpar_linha_hotel(linha, "") is not None:
+            continue
+        if any(palavra in linha for palavra in _CABECALHOS_HOTEL):
+            continue
+        if _RE_VALOR_NEGATIVO.search(linha):
+            continue
+        perdidas.append(linha)
+        if len(perdidas) == _MAX_LINHAS_PERDIDAS:
+            break
+    return perdidas
 
 
 def _chave_lancamento(registro: Dict) -> tuple:
