@@ -441,7 +441,8 @@ def _separar_diaria(info: str) -> Tuple[str, str, str]:
     if not achado:
         return info.upper(), "", ""
     obs = achado.group("obs").strip(" ()")
-    return achado.group("tipo").upper(), achado.group("apartamento").strip(), obs
+    apartamento = " ".join(_digitos_recuperados(t) for t in achado.group("apartamento").split())
+    return achado.group("tipo").upper(), apartamento, obs
 
 
 # Data que abre a linha de lançamento. O ano de 4 dígitos só é aceito quando começa
@@ -471,6 +472,37 @@ def _normalizar_valor_hotel(valor: str) -> float:
 # três: com menos, o token seria quantidade solta ou ruído, não dinheiro.
 _TOKEN_VALOR_SEM_VIRGULA = re.compile(r'^\d{3,}$')
 
+# Letras que o OCR devolve no lugar de algarismos, pelo desenho parecido. É o que
+# transforma "2,00 5,00 10,00" em "2,OO 5,OO 1O,OO" e faz a linha inteira ser
+# descartada, porque nenhum desses tokens é reconhecido como dinheiro.
+_LETRAS_POR_DIGITO = str.maketrans({
+    "O": "0", "o": "0", "D": "0", "Q": "0",
+    "I": "1", "l": "1", "i": "1", "|": "1",
+    "Z": "2", "z": "2",
+    "S": "5", "s": "5",
+    "G": "6", "b": "6",
+    "T": "7",
+    "B": "8",
+    "g": "9", "q": "9",
+})
+
+
+def _digitos_recuperados(token: str) -> str:
+    """Troca por algarismo as letras que o OCR confundiu, quando o token é um número.
+
+    Só devolve algo diferente quando sobra exclusivamente o que compõe um número, uma
+    data ou uma hora: "2,OO" vira "2,00" e "OO,OO" vira "00,00", mas "BLUSA", "MST2" e
+    "GAS" não viram número nenhum, e "A46539" segue sendo a comanda que é. Tokens de
+    uma ou duas letras ficam de fora — "OS" virando "05" seria chute, não leitura.
+    """
+    if len(token) < 3 and not any(caractere.isdigit() for caractere in token):
+        return token
+    recuperado = token.translate(_LETRAS_POR_DIGITO)
+    # A barra e os dois-pontos entram porque data e hora passam por aqui; deixar o
+    # token virar número só quando sobra exclusivamente o que compõe um número, uma
+    # data ou uma hora é o que preserva "A46539" e "MST2".
+    return recuperado if re.fullmatch(r'[\d.,:/]+', recuperado) else token
+
 
 # A linha do extrato tem seis colunas numéricas: Qtde, Unidade, Bruto, Desc., Taxas e
 # Total. Parar nelas evita que a leitura siga para trás e recolha como valor um pedaço
@@ -483,7 +515,7 @@ def _valores_do_fim(partes: List[str], tolerante: bool) -> Tuple[int, List[float
     valores: List[float] = []
     i = len(partes) - 1
     while i >= 0 and len(valores) < _COLUNAS_NUMERICAS_HOTEL:
-        token = partes[i]
+        token = partes[i] if not tolerante else _digitos_recuperados(partes[i])
         if _TOKEN_VALOR_HOTEL.match(token):
             valores.insert(0, _normalizar_valor_hotel(token))
         elif tolerante and _TOKEN_VALOR_SEM_VIRGULA.match(token):
@@ -589,6 +621,12 @@ def limpar_linha_hotel(linha, nome_hospede):
     #    "11/06/26"); sem isso a linha seria descartada.
     match = _RE_DATA_HOTEL.match(linha)
     if not match:
+        # Data e hora também chegam com letra no lugar do algarismo ("O1/1O/26 O6:O9"),
+        # e aí a linha inteira era descartada antes mesmo de alguém olhar os valores.
+        cabeca = linha.split(" ")
+        linha = " ".join([_digitos_recuperados(t) for t in cabeca[:2]] + cabeca[2:])
+        match = _RE_DATA_HOTEL.match(linha)
+    if not match:
         return None
     data = match.group(1)
     resto = linha[match.end():].strip()
@@ -613,7 +651,10 @@ def limpar_linha_hotel(linha, nome_hospede):
         return None
     # 4. Monta a informação adicional (tudo antes dos números) e captura a Comanda
     info_completa = " ".join(partes[:i + 1]).replace("|", "-").strip()
-    m_comanda = re.search(r'Comanda\s+([A-Za-z]*\d+)', info_completa, re.IGNORECASE)
+    # A comanda é capturada inteira, letras no meio inclusive: lida como "A4GS39" pelo
+    # OCR, o padrão antigo guardava só o "A4" e duas comandas diferentes viravam a
+    # mesma chave — bastava isso para a correção de datas uniformizar o que não devia.
+    m_comanda = re.search(r'Comanda\s+([A-Za-z0-9]+)', info_completa, re.IGNORECASE)
     comanda = m_comanda.group(1).upper() if m_comanda else None
     info = re.split(r'\s*-\s*Comanda', info_completa, flags=re.IGNORECASE)[0].strip()
     info = _corrigir_descricao(info)
@@ -708,6 +749,16 @@ def _em_reais(valor: float) -> str:
     return "R$ " + f"{valor:,.2f}".translate(str.maketrans(",.", ".,"))
 
 
+def _sem_cifrao_de_formula(texto: str) -> str:
+    """Escapa o cifrão para o Streamlit não ler o trecho como fórmula matemática.
+
+    O markdown do Streamlit trata "$...$" como LaTeX, então "R$ 15,00 e foram
+    extraídos R$ 5,00" aparecia na tela como "R 15,00 e foram extraídos R" em fonte de
+    fórmula, comendo os cifrões e o espaçamento no meio do aviso.
+    """
+    return texto.replace("$", r"\$")
+
+
 def _total_do_documento(texto: str) -> Optional[float]:
     """Valor do "Sub-total" do extrato, ou None quando a leitura não o encontrou."""
     achado = _RE_SUBTOTAL_HOTEL.search(texto)
@@ -728,11 +779,46 @@ def _conferir_com_o_documento(dados: List[Dict], texto: str, arquivo: str) -> No
     extraido = sum(registro["Total"] for registro in dados)
     if _fecha(extraido, esperado):
         return
-    st.warning(
+    aviso = (
         f"⚠️ {arquivo}: o extrato fecha em {_em_reais(esperado)} e foram extraídos "
         f"{_em_reais(extraido)} — diferença de {_em_reais(abs(esperado - extraido))}. "
         "Confira o documento: alguma linha pode não ter sido lida."
     )
+    perdidas = _linhas_nao_aproveitadas(texto)
+    if perdidas:
+        # Mostrar o que a leitura descartou transforma "falta dinheiro" em "falta esta
+        # linha, lida assim" — é com isso que o defeito do OCR vira conserto.
+        aviso += "\n\nLinhas que começam por data e não viraram lançamento:\n" + "\n".join(
+            f"- `{linha}`" for linha in perdidas
+        )
+    st.warning(_sem_cifrao_de_formula(aviso))
+
+
+# Quantas linhas descartadas mostrar: o suficiente para reconhecer o padrão do erro,
+# sem transformar o aviso num despejo de texto.
+_MAX_LINHAS_PERDIDAS = 5
+
+# Crédito e pagamento também abrem com data, mas ficam de fora da extração de
+# propósito — são a contrapartida do faturamento, e listá-los como linha perdida
+# mandaria o usuário procurar defeito onde não há. O sinal é o valor negativo.
+_RE_VALOR_NEGATIVO = re.compile(r'-\s?\d+[.,]\d{2}')
+
+
+def _linhas_nao_aproveitadas(texto: str) -> List[str]:
+    """Linhas que parecem lançamento (começam por data) e a leitura não aproveitou."""
+    perdidas = []
+    for linha in dict.fromkeys(texto.split("\n")):
+        linha = linha.strip()
+        if not _RE_DATA_HOTEL.match(linha) or limpar_linha_hotel(linha, "") is not None:
+            continue
+        if any(palavra in linha for palavra in _CABECALHOS_HOTEL):
+            continue
+        if _RE_VALOR_NEGATIVO.search(linha):
+            continue
+        perdidas.append(linha)
+        if len(perdidas) == _MAX_LINHAS_PERDIDAS:
+            break
+    return perdidas
 
 
 def _chave_lancamento(registro: Dict) -> tuple:
