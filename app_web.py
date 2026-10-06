@@ -292,9 +292,11 @@ def extrair_fiscal(arquivo_pdf, usar_ocr: bool):
 
 # ==================== EXTRAÇÃO HOTEL ====================
 # Token monetário no formato brasileiro (15,00 / 1.234,56) ou lido pelo OCR com
-# ponto no lugar da vírgula (15.00 / 1.234.56). Sempre com 2 casas decimais, o que
-# evita capturar códigos ou números soltos da descrição.
-_TOKEN_VALOR_HOTEL = re.compile(r'^\d{1,3}(?:\.\d{3})*[.,]\d{2}$')
+# ponto no lugar da vírgula (15.00 / 1.234.56). São as duas casas decimais que evitam
+# capturar código ou número solto da descrição, então a parte inteira não precisa ser
+# limitada a três dígitos: o extrato escreve milhar sem ponto ("13103,00"), e exigir
+# o separador fazia qualquer lançamento de R$ 1.000,00 para cima passar despercebido.
+_TOKEN_VALOR_HOTEL = re.compile(r'^\d+(?:\.\d{3})*[.,]\d{2}$')
 
 # O rótulo do hóspede chega do OCR com trocas típicas (Hospede, H0spede, princ1pal).
 # Exigir a grafia exata fazia o nome se perder e a planilha inteira sair como
@@ -664,6 +666,43 @@ def _reserva_do_texto(texto: str) -> str:
     return achado.group(1) if achado else ""
 
 
+# O extrato fecha com "Sub-total": a soma de diárias e consumos, exatamente a conta
+# que a extração faz. É o gabarito que o próprio documento carrega.
+_RE_SUBTOTAL_HOTEL = re.compile(r'Sub\s*[-–—]?\s*total\s*(\d+(?:\.\d{3})*,\d{2})', re.IGNORECASE)
+
+
+def _em_reais(valor: float) -> str:
+    """Formata um valor no padrão brasileiro: R$ 13.103,00."""
+    return "R$ " + f"{valor:,.2f}".translate(str.maketrans(",.", ".,"))
+
+
+def _total_do_documento(texto: str) -> Optional[float]:
+    """Valor do "Sub-total" do extrato, ou None quando a leitura não o encontrou."""
+    achado = _RE_SUBTOTAL_HOTEL.search(texto)
+    return _normalizar_valor_hotel(achado.group(1)) if achado else None
+
+
+def _conferir_com_o_documento(dados: List[Dict], texto: str, arquivo: str) -> None:
+    """Compara o que foi extraído com o total que o próprio extrato declara.
+
+    Uma linha que o OCR leu mal não vira erro: ela simplesmente não casa o padrão e
+    some, e a planilha fica com um valor a menos sem nada avisando — foi assim que um
+    lançamento de água se perdeu num extrato de dois. O documento traz a resposta no
+    rodapé, então a conta é conferida contra ela e a diferença aparece na tela.
+    """
+    esperado = _total_do_documento(texto)
+    if esperado is None:
+        return
+    extraido = sum(registro["Total"] for registro in dados)
+    if _fecha(extraido, esperado):
+        return
+    st.warning(
+        f"⚠️ {arquivo}: o extrato fecha em {_em_reais(esperado)} e foram extraídos "
+        f"{_em_reais(extraido)} — diferença de {_em_reais(abs(esperado - extraido))}. "
+        "Confira o documento: alguma linha pode não ter sido lida."
+    )
+
+
 def _chave_lancamento(registro: Dict) -> tuple:
     """O que identifica um lançamento dentro de uma estadia."""
     return (
@@ -797,7 +836,11 @@ def extrair_hotel(arquivo_pdf, usar_ocr=False):
     for linha_dados in dados:
         linha_dados["_reserva"] = reserva
         linha_dados["_origem"] = arquivo_pdf.name
-    return reparar_quantidades(_corrigir_datas_por_comanda(dados))
+    dados = reparar_quantidades(_corrigir_datas_por_comanda(dados))
+    # A conferência é por arquivo, antes de juntar a rodada: cada extrato declara o
+    # seu próprio total, e é com ele que o que saiu dali tem de fechar.
+    _conferir_com_o_documento(dados, "\n".join([texto_completo, texto_ocr]), arquivo_pdf.name)
+    return dados
 
 # ==================== EXTRAÇÃO EXAMES ====================
 def extrair_exames(arquivo_pdf):
