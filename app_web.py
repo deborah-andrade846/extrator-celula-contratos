@@ -614,8 +614,51 @@ def reparar_quantidades(dados: List[Dict]) -> List[Dict]:
     return dados
 
 
+# O OCR lê a borda da tabela como caractere e o cola antes da data: "| 01/10/26",
+# "'01/10/26", "_01/10/26". Com isso a linha não começava por data e o lançamento
+# sumia sem aviso — nem a lista de linhas descartadas o mostrava, porque ela também
+# procura a data no começo. Só sai pontuação: letra e algarismo ficam.
+_RE_LIXO_ANTES_DA_DATA = re.compile(r'^[^0-9A-Za-zÀ-ÿ]+(?=[\dOoIlSB]{1,2}\s*/)')
+
+
+def _sem_lixo_inicial(linha: str) -> str:
+    """Tira a pontuação que o OCR cola antes da data no começo da linha."""
+    return _RE_LIXO_ANTES_DA_DATA.sub("", linha.strip())
+
+
+# A fonte do extrato é fina e falhada justamente no "1" e na barra: o OCR lê
+# "01/10/26" como "0110/26", "05/10/26" como "05Ã0/26", "27/10/26" como "27h0/26" e
+# "11/10/26" como "N/0/26". O resto da linha sai perfeito — hora, descrição, comanda,
+# valores —, mas sem data válida o lançamento inteiro era descartado: foi assim que
+# um mês de outubro perdeu diárias e lavanderia em quase metade dos extratos. O que
+# sobra legível é o ano no fim ("/26") e, quase sempre, os dois algarismos do dia.
+_RE_DATA_ILEGIVEL = re.compile(r'^(?P<miolo>\S{1,6})/(?P<ano>\d{2})$')
+_RE_HORA_HOTEL = re.compile(r'^\d{1,2}[:.]?\d{2}$')
+
+
+def _data_ilegivel(linha: str) -> Optional[Dict]:
+    """Reconhece a linha de lançamento cuja data o OCR estragou além do conserto.
+
+    Exige o que só uma linha de lançamento tem: um token terminado em "/AA" seguido da
+    hora. Devolve o ano e o dia que deu para ler (ou None), e a data em si é decidida
+    depois, com o documento inteiro à vista — ver ``_resolver_datas_ilegiveis``.
+    """
+    tokens = linha.split()
+    if len(tokens) < 3 or not _RE_HORA_HOTEL.match(tokens[1]):
+        return None
+    achado = _RE_DATA_ILEGIVEL.match(tokens[0])
+    if not achado:
+        return None
+    # Dois "1" finos lado a lado viram "N": "11/10/26" chega como "N/0/26" ou "NÃo/26".
+    miolo = achado.group("miolo")
+    miolo = "11" + miolo[1:] if miolo.startswith("N") else miolo
+    inicio = miolo[:2].translate(_LETRAS_POR_DIGITO)
+    dia = int(inicio) if inicio.isdigit() and 1 <= int(inicio) <= 31 else None
+    return {"lido": tokens[0], "ano": achado.group("ano"), "dia": dia}
+
+
 def limpar_linha_hotel(linha, nome_hospede):
-    linha = linha.strip()
+    linha = _sem_lixo_inicial(linha)
     # 1. A linha precisa começar por uma data. O dia/mês podem vir com 1 dígito
     #    porque o OCR às vezes perde um algarismo (ex.: lê "1/06/26" em vez de
     #    "11/06/26"); sem isso a linha seria descartada.
@@ -626,10 +669,17 @@ def limpar_linha_hotel(linha, nome_hospede):
         cabeca = linha.split(" ")
         linha = " ".join([_digitos_recuperados(t) for t in cabeca[:2]] + cabeca[2:])
         match = _RE_DATA_HOTEL.match(linha)
+    data_incerta = None
     if not match:
-        return None
-    data = match.group(1)
-    resto = linha[match.end():].strip()
+        data_incerta = _data_ilegivel(linha)
+        if data_incerta is None:
+            return None
+    if match:
+        data = match.group(1)
+        resto = linha[match.end():].strip()
+    else:
+        data = ""
+        resto = linha.split(" ", 1)[1].strip()
     # 2. Remove um horário opcional logo após a data. Aceita HH:MM / HH:MM:SS e
     #    também formas em que o OCR perdeu o separador ou trocou por ponto
     #    (ex.: "1412", "0915", "10.11").
@@ -673,7 +723,86 @@ def limpar_linha_hotel(linha, nome_hospede):
         "_info": info,
         "_sem_hora": not hora_lida,
         "_conferido": conferido,
+        "_data_incerta": data_incerta,
     }
+
+# Marca, na coluna Observação, a data que foi deduzida sem confirmação.
+_MARCA_CONFERIR_DATA = "Conferir data"
+
+
+def _como_data(texto: str):
+    """"dd/mm/aa" (ou dd/mm/aaaa) como date, ou None se não for uma data válida."""
+    from datetime import datetime
+    for formato in ("%d/%m/%y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(texto, formato).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _resolver_datas_ilegiveis(dados: List[Dict], texto: str = "") -> List[Dict]:
+    """Dá data aos lançamentos cuja data o OCR não deixou ler.
+
+    O extrato carrega a resposta em volta da linha: os itens da mesma Comanda têm a
+    mesma data; as linhas vêm em ordem cronológica; e o mês é o do extrato. Por ordem
+    de confiança: a data da Comanda; o dia lido no mês do extrato, se cabe entre as
+    linhas vizinhas; a data das vizinhas quando elas concordam (ou o dia do meio,
+    numa sequência de diárias). O que só sair por palpite fica marcado para conferir.
+    """
+    from collections import Counter
+    from datetime import date, timedelta
+    certas = [(i, _como_data(d["Data"])) for i, d in enumerate(dados) if not d.get("_data_incerta")]
+    certas = [(i, dt) for i, dt in certas if dt]
+    if not any(d.get("_data_incerta") for d in dados):
+        return dados
+    meses = Counter((dt.month, dt.year) for _, dt in certas)
+    if not meses:
+        # Extrato de uma linha só, e é ela que perdeu a data: o mês vem do cabeçalho
+        # (entrada, saída e emissão do extrato), que fica numa fonte mais legível.
+        cabecalho = (_como_data(t) for t in re.findall(r'\b\d{2}/\d{2}/\d{2}(?:\d{2})?\b', texto))
+        meses = Counter((dt.month, dt.year) for dt in cabecalho if dt)
+    por_comanda = {}
+    for i, dt in certas:
+        if dados[i].get("_comanda"):
+            por_comanda.setdefault(dados[i]["_comanda"], Counter())[dt] += 1
+
+    for i, registro in enumerate(dados):
+        incerta = registro.get("_data_incerta")
+        if not incerta:
+            continue
+        anterior = next((dt for j, dt in reversed(certas) if j < i), None)
+        seguinte = next((dt for j, dt in certas if j > i), None)
+        palpite = None
+        if incerta["dia"] and meses:
+            mes, ano = meses.most_common(1)[0][0]
+            try:
+                palpite = date(ano, mes, incerta["dia"])
+            except ValueError:
+                palpite = None
+        cabe = palpite and (anterior is None or anterior <= palpite) and (seguinte is None or palpite <= seguinte)
+
+        escolhida, segura = None, True
+        if registro.get("_comanda") in por_comanda:
+            escolhida = por_comanda[registro["_comanda"]].most_common(1)[0][0]
+        elif cabe:
+            escolhida = palpite
+        elif anterior and seguinte and anterior == seguinte:
+            escolhida = anterior
+        elif anterior and seguinte and (seguinte - anterior).days == 2:
+            escolhida = anterior + timedelta(days=1)
+        else:
+            escolhida, segura = palpite or anterior or seguinte, False
+
+        if escolhida:
+            registro["Data"] = escolhida.strftime("%d/%m/%y")
+        else:
+            registro["Data"] = incerta["lido"]
+            segura = False
+        if not segura:
+            registro["Observação"] = " - ".join(filter(None, [registro["Observação"], _MARCA_CONFERIR_DATA]))
+    return dados
+
 
 def _corrigir_datas_por_comanda(dados):
     """Corrige datas quebradas pelo OCR usando a Comanda como âncora.
@@ -765,6 +894,23 @@ def _total_do_documento(texto: str) -> Optional[float]:
     return _normalizar_valor_hotel(achado.group(1)) if achado else None
 
 
+def _totais_declarados(texto: str) -> List[float]:
+    """Todos os totais que o extrato declara: o Sub-total e as linhas "Total BRL".
+
+    O mesmo "1" fino que some das datas some dos totais: "1100,00" já foi lido como
+    "100,00" no Sub-total, e o aviso acusava R$ 1.000,00 de diferença num extrato que
+    fechava. A linha "Total BRL" da tabela repete o valor (Bruto e Total), e basta uma
+    das leituras bater para o documento estar conferido.
+    """
+    totais = [t for t in [_total_do_documento(texto)] if t is not None]
+    for linha in texto.split("\n"):
+        if re.match(r'\s*Total\s+BRL\b', linha, re.IGNORECASE):
+            valores = _valores_do_fim(linha.split(), tolerante=False)[1]
+            if len(valores) >= 2:
+                totais.extend([valores[0], valores[-1]])
+    return totais
+
+
 def _conferir_com_o_documento(dados: List[Dict], texto: str, arquivo: str) -> None:
     """Compara o que foi extraído com o total que o próprio extrato declara.
 
@@ -777,7 +923,7 @@ def _conferir_com_o_documento(dados: List[Dict], texto: str, arquivo: str) -> No
     if esperado is None:
         return
     extraido = sum(registro["Total"] for registro in dados)
-    if _fecha(extraido, esperado):
+    if any(_fecha(extraido, total) for total in _totais_declarados(texto)):
         return
     aviso = (
         f"⚠️ {arquivo}: o extrato fecha em {_em_reais(esperado)} e foram extraídos "
@@ -788,7 +934,7 @@ def _conferir_com_o_documento(dados: List[Dict], texto: str, arquivo: str) -> No
     if perdidas:
         # Mostrar o que a leitura descartou transforma "falta dinheiro" em "falta esta
         # linha, lida assim" — é com isso que o defeito do OCR vira conserto.
-        aviso += "\n\nLinhas que começam por data e não viraram lançamento:\n" + "\n".join(
+        aviso += "\n\nLinhas com cara de lançamento que não viraram lançamento:\n" + "\n".join(
             f"- `{linha}`" for linha in perdidas
         )
     st.warning(_sem_cifrao_de_formula(aviso))
@@ -809,7 +955,19 @@ def _linhas_nao_aproveitadas(texto: str) -> List[str]:
     perdidas = []
     for linha in dict.fromkeys(texto.split("\n")):
         linha = linha.strip()
-        if not _RE_DATA_HOTEL.match(linha) or limpar_linha_hotel(linha, "") is not None:
+        if limpar_linha_hotel(linha, "") is not None:
+            continue
+        # Começar por data é o sinal de lançamento; mas quando o OCR estragou a data
+        # além do conserto, a linha ainda se denuncia pelos números do fim (Qtde,
+        # Unidade, ..., Total). Sem isso ela some e o aviso fica sem pista nenhuma.
+        # A hora separa o lançamento dos quadros de resumo ("Total BRL", "Frigobar
+        # APT"), que também terminam em números mas nunca trazem hora.
+        parece_lancamento = (
+            _RE_DATA_HOTEL.match(_sem_lixo_inicial(linha))
+            or (len(_valores_do_fim(linha.split(), tolerante=False)[1]) >= 3
+                and re.search(r'(?:^|\s)\d{1,2}:\d{2}(?:\s|$)', linha))
+        )
+        if not parece_lancamento:
             continue
         if any(palavra in linha for palavra in _CABECALHOS_HOTEL):
             continue
@@ -862,7 +1020,8 @@ def remover_lancamentos_repetidos(dados: List[Dict]) -> Tuple[List[Dict], int]:
 
     resultado = [registro for indice, registro in enumerate(dados) if indice in manter]
     for registro in resultado:
-        for interno in ("_comanda", "_reserva", "_origem", "_info", "_sem_hora", "_conferido"):
+        for interno in ("_comanda", "_reserva", "_origem", "_info", "_sem_hora", "_conferido",
+                        "_data_incerta"):
             registro.pop(interno, None)
     return resultado, len(dados) - len(resultado)
 
@@ -954,7 +1113,8 @@ def extrair_hotel(arquivo_pdf, usar_ocr=False):
     for linha_dados in dados:
         linha_dados["_reserva"] = reserva
         linha_dados["_origem"] = arquivo_pdf.name
-    dados = reparar_quantidades(_corrigir_datas_por_comanda(dados))
+    dados = reparar_quantidades(_corrigir_datas_por_comanda(
+        _resolver_datas_ilegiveis(dados, "\n".join([texto_completo, texto_ocr]))))
     # A conferência é por arquivo, antes de juntar a rodada: cada extrato declara o
     # seu próprio total, e é com ele que o que saiu dali tem de fechar.
     _conferir_com_o_documento(dados, "\n".join([texto_completo, texto_ocr]), arquivo_pdf.name)
