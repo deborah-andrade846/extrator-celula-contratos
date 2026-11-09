@@ -614,8 +614,20 @@ def reparar_quantidades(dados: List[Dict]) -> List[Dict]:
     return dados
 
 
+# O OCR lê a borda da tabela como caractere e o cola antes da data: "| 01/10/26",
+# "'01/10/26", "_01/10/26". Com isso a linha não começava por data e o lançamento
+# sumia sem aviso — nem a lista de linhas descartadas o mostrava, porque ela também
+# procura a data no começo. Só sai pontuação: letra e algarismo ficam.
+_RE_LIXO_ANTES_DA_DATA = re.compile(r'^[^0-9A-Za-zÀ-ÿ]+(?=[\dOoIlSB]{1,2}\s*/)')
+
+
+def _sem_lixo_inicial(linha: str) -> str:
+    """Tira a pontuação que o OCR cola antes da data no começo da linha."""
+    return _RE_LIXO_ANTES_DA_DATA.sub("", linha.strip())
+
+
 def limpar_linha_hotel(linha, nome_hospede):
-    linha = linha.strip()
+    linha = _sem_lixo_inicial(linha)
     # 1. A linha precisa começar por uma data. O dia/mês podem vir com 1 dígito
     #    porque o OCR às vezes perde um algarismo (ex.: lê "1/06/26" em vez de
     #    "11/06/26"); sem isso a linha seria descartada.
@@ -788,7 +800,7 @@ def _conferir_com_o_documento(dados: List[Dict], texto: str, arquivo: str) -> No
     if perdidas:
         # Mostrar o que a leitura descartou transforma "falta dinheiro" em "falta esta
         # linha, lida assim" — é com isso que o defeito do OCR vira conserto.
-        aviso += "\n\nLinhas que começam por data e não viraram lançamento:\n" + "\n".join(
+        aviso += "\n\nLinhas com cara de lançamento que não viraram lançamento:\n" + "\n".join(
             f"- `{linha}`" for linha in perdidas
         )
     st.warning(_sem_cifrao_de_formula(aviso))
@@ -809,7 +821,16 @@ def _linhas_nao_aproveitadas(texto: str) -> List[str]:
     perdidas = []
     for linha in dict.fromkeys(texto.split("\n")):
         linha = linha.strip()
-        if not _RE_DATA_HOTEL.match(linha) or limpar_linha_hotel(linha, "") is not None:
+        if limpar_linha_hotel(linha, "") is not None:
+            continue
+        # Começar por data é o sinal de lançamento; mas quando o OCR estragou a data
+        # além do conserto, a linha ainda se denuncia pelos números do fim (Qtde,
+        # Unidade, ..., Total). Sem isso ela some e o aviso fica sem pista nenhuma.
+        parece_lancamento = (
+            _RE_DATA_HOTEL.match(_sem_lixo_inicial(linha))
+            or len(_valores_do_fim(linha.split(), tolerante=False)[1]) >= 3
+        )
+        if not parece_lancamento:
             continue
         if any(palavra in linha for palavra in _CABECALHOS_HOTEL):
             continue
