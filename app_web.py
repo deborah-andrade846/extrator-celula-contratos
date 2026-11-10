@@ -633,7 +633,11 @@ def _sem_lixo_inicial(linha: str) -> str:
 # um mês de outubro perdeu diárias e lavanderia em quase metade dos extratos. O que
 # sobra legível é o ano no fim ("/26") e, quase sempre, os dois algarismos do dia.
 _RE_DATA_ILEGIVEL = re.compile(r'^(?P<miolo>\S{1,6})/(?P<ano>\d{2})$')
-_RE_HORA_HOTEL = re.compile(r'^\d{1,2}[:.]?\d{2}$')
+# A hora também sai estragada: "16:41" chega como "1641", "16.41", "16-41" ou
+# "16 41". Os dois algarismos dos minutos depois de um ou dois da hora, com no
+# máximo um sinal (ou espaço) entre eles, é a forma que resiste ao OCR.
+_HORA_HOTEL = r'\d{1,2}(?:[:.;,°\-]|\s)?\d{2}'
+_RE_HORA_HOTEL = re.compile(rf'^{_HORA_HOTEL}(?:\s|$)')
 
 
 def _data_ilegivel(linha: str) -> Optional[Dict]:
@@ -644,7 +648,7 @@ def _data_ilegivel(linha: str) -> Optional[Dict]:
     depois, com o documento inteiro à vista — ver ``_resolver_datas_ilegiveis``.
     """
     tokens = linha.split()
-    if len(tokens) < 3 or not _RE_HORA_HOTEL.match(tokens[1]):
+    if len(tokens) < 3 or not _RE_HORA_HOTEL.match(" ".join(tokens[1:])):
         return None
     achado = _RE_DATA_ILEGIVEL.match(tokens[0])
     if not achado:
@@ -655,6 +659,32 @@ def _data_ilegivel(linha: str) -> Optional[Dict]:
     inicio = miolo[:2].translate(_LETRAS_POR_DIGITO)
     dia = int(inicio) if inicio.isdigit() and 1 <= int(inicio) <= 31 else None
     return {"lido": tokens[0], "ano": achado.group("ano"), "dia": dia}
+
+
+# Marca, na coluna Observação, o Total que o OCR leu errado e a conta da linha refez.
+_MARCA_TOTAL_CORRIGIDO = "Total refeito pela conta da linha"
+
+
+def _total_pela_conta(valores: List[float]) -> float:
+    """O Total da linha, refeito pela conta quando o OCR o leu errado.
+
+    O OCR troca o "8" por "3" com frequência: "CAMISETA 1,00 8,00 8,00 0,00 0,00 3,00"
+    entrava na planilha com R$ 3,00, e a linha nem aparecia como perdida — ela foi
+    aproveitada, só que com o valor errado. A própria linha tem como provar o engano:
+    Qtde × Unidade e o Bruto são duas leituras independentes; quando concordam entre
+    si, Bruto − Desc. + Taxas é o Total, e o número lido no fim é que está errado.
+    Só vale com as seis colunas lidas — com menos, não há duas testemunhas.
+    """
+    if len(valores) != _COLUNAS_NUMERICAS_HOTEL:
+        return valores[-1]
+    qtde, unitario, bruto, desconto, taxas, total = valores
+    pela_conta = bruto - desconto + taxas
+    # Total igual ao Bruto é leitura confirmada: aí quem errou foi Desc. ou Taxas
+    # ("0,00" lido "9,00"), e refazer a conta com eles estragaria um Total certo.
+    if (bruto > 0 and _fecha(qtde * unitario, bruto) and not _fecha(total, bruto)
+            and not _fecha(pela_conta, total)):
+        return round(pela_conta, 2)
+    return total
 
 
 def limpar_linha_hotel(linha, nome_hospede):
@@ -683,7 +713,7 @@ def limpar_linha_hotel(linha, nome_hospede):
     # 2. Remove um horário opcional logo após a data. Aceita HH:MM / HH:MM:SS e
     #    também formas em que o OCR perdeu o separador ou trocou por ponto
     #    (ex.: "1412", "0915", "10.11").
-    resto, hora_lida = re.subn(r'^\d{1,2}[:.]?\d{2}(?::\d{2})?\s*', '', resto)
+    resto, hora_lida = re.subn(rf'^{_HORA_HOTEL}(?::\d{{2}})?(?=\s|$)\s*', '', resto)
     partes = resto.split()
     # 3. Coleta os tokens numéricos finais (Qtde Unidade Bruto Desc. Taxas Total).
     #    O OCR às vezes come a vírgula e devolve "100" no lugar de "1,00". Quando isso
@@ -709,6 +739,10 @@ def limpar_linha_hotel(linha, nome_hospede):
     info = re.split(r'\s*-\s*Comanda', info_completa, flags=re.IGNORECASE)[0].strip()
     info = _corrigir_descricao(info)
     descricao, apartamento, observacao = _separar_diaria(info)
+    total = _total_pela_conta(valores)
+    if total != valores[-1]:
+        observacao = " - ".join(filter(None, [observacao, _MARCA_TOTAL_CORRIGIDO]))
+        valores = valores[:-1] + [total]
     qtde, unitario, conferido = _quantidade_e_unitario(valores)
     return {
         "Arquivo": nome_hospede,
@@ -938,6 +972,14 @@ def _conferir_com_o_documento(dados: List[Dict], texto: str, arquivo: str) -> No
             f"- `{linha}`" for linha in perdidas
         )
     st.warning(_sem_cifrao_de_formula(aviso))
+    # Quando nem a lista acima explica a diferença, o texto que o OCR devolveu é o que
+    # resta para achar o defeito. Só as linhas com valor em reais: ficam de fora CPF,
+    # endereço e telefone do cabeçalho, e o trecho pode ser enviado a quem for consertar.
+    linhas_com_valor = [linha for linha in dict.fromkeys(texto.split("\n"))
+                        if re.search(r'\d[.,]\d{2}(?:\s|$)', linha)]
+    if linhas_com_valor:
+        with st.expander(f"Ver o texto que a leitura obteve de {arquivo}"):
+            st.code("\n".join(linhas_com_valor), language=None)
 
 
 # Quantas linhas descartadas mostrar: o suficiente para reconhecer o padrão do erro,
@@ -953,8 +995,11 @@ _RE_VALOR_NEGATIVO = re.compile(r'-\s?\d+[.,]\d{2}')
 def _linhas_nao_aproveitadas(texto: str) -> List[str]:
     """Linhas que parecem lançamento (começam por data) e a leitura não aproveitou."""
     perdidas = []
-    for linha in dict.fromkeys(texto.split("\n")):
-        linha = linha.strip()
+    partes = [parte
+              for linha in dict.fromkeys(texto.split("\n"))
+              if not any(palavra in linha for palavra in _CABECALHOS_HOTEL)
+              for parte in _separar_lancamentos_grudados(linha.strip())]
+    for linha in dict.fromkeys(partes):
         if limpar_linha_hotel(linha, "") is not None:
             continue
         # Começar por data é o sinal de lançamento; mas quando o OCR estragou a data
@@ -965,7 +1010,8 @@ def _linhas_nao_aproveitadas(texto: str) -> List[str]:
         parece_lancamento = (
             _RE_DATA_HOTEL.match(_sem_lixo_inicial(linha))
             or (len(_valores_do_fim(linha.split(), tolerante=False)[1]) >= 3
-                and re.search(r'(?:^|\s)\d{1,2}:\d{2}(?:\s|$)', linha))
+                and (re.search(r'(?:^|\s)\d{1,2}:\d{2}(?:\s|$)', linha)
+                     or re.search(r'Comanda|Apart', linha, re.IGNORECASE)))
         )
         if not parece_lancamento:
             continue
@@ -1029,6 +1075,24 @@ def remover_lancamentos_repetidos(dados: List[Dict]) -> Tuple[List[Dict], int]:
 _CABECALHOS_HOTEL = ["PLAZA HOTEL", "Apartamento:", "Fechado", "Pagamentos", "Tarifário:"]
 
 
+# Começo de um lançamento no meio da linha: data (inteira ou estragada, ver
+# _RE_DATA_ILEGIVEL) seguida da hora. Só serve para cortar, não para ler.
+_RE_INICIO_LANCAMENTO = re.compile(
+    rf'\s(?=(?:\d{{1,2}}/\d{{1,2}}/\d{{2,4}}|\S{{1,6}}/\d{{2}})\s+\d{{1,2}}(?:[:.;,°\-]|\s)?\d{{2}}\s)')
+
+
+def _separar_lancamentos_grudados(linha: str) -> List[str]:
+    """Divide a linha em que o OCR juntou dois lançamentos.
+
+    Com as linhas da tabela muito próximas, o Tesseract às vezes lê duas como uma:
+    "19/10/26 15:41 AGUA ... 10,00 20/10/26 09:26 AGUA ... 10,00". A leitura pega os
+    números do fim, aproveita o segundo lançamento e o primeiro some sem aviso —
+    nem aparece como linha descartada, porque a linha foi aproveitada. Uma segunda
+    data seguida de hora no meio da linha é o começo de outro lançamento.
+    """
+    return [parte.strip() for parte in _RE_INICIO_LANCAMENTO.split(linha) if parte.strip()]
+
+
 def _lancamentos_do_texto(texto, identificacao):
     """Lê um bloco de texto (direto ou de OCR) e devolve (lançamentos, hóspede)."""
     registros = []
@@ -1040,9 +1104,10 @@ def _lancamentos_do_texto(texto, identificacao):
             continue
         if any(palavra in linha for palavra in _CABECALHOS_HOTEL):
             continue
-        linha_extraida = limpar_linha_hotel(linha, nome_hospede or identificacao)
-        if linha_extraida:
-            registros.append(linha_extraida)
+        for parte in _separar_lancamentos_grudados(linha):
+            linha_extraida = limpar_linha_hotel(parte, nome_hospede or identificacao)
+            if linha_extraida:
+                registros.append(linha_extraida)
     return registros, nome_hospede
 
 

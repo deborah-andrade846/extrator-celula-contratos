@@ -67,6 +67,27 @@ def abrir_navegador(porta: int) -> None:
         time.sleep(0.3)
 
 
+def neutralizar_httptools_incompleto() -> None:
+    """Faz o servidor ignorar um ``httptools`` que está pela metade.
+
+    O uvicorn (servidor web do Streamlit) usa o ``httptools`` sempre que ``import
+    httptools`` funciona. Extrair o pacote novo por cima da pasta de uma versão
+    antiga deixa para trás ``_internal\\httptools`` sem o código dentro: o import
+    funciona como pasta vazia, e cada conexão do navegador morre com "module
+    'httptools' has no attribute 'HttpRequestParser'" — o programa fica rodando e
+    a página nunca abre. Marcando o módulo como ausente, o uvicorn usa o h11, que
+    vem completo no pacote.
+    """
+    try:
+        import httptools
+        httptools.HttpRequestParser  # noqa: B018 — só confere se existe
+    except ImportError:
+        return  # ausente de verdade: o uvicorn já cai no h11 sozinho
+    except Exception:
+        sys.modules.pop("httptools", None)
+        sys.modules["httptools"] = None  # faz o próximo import levantar ImportError
+
+
 def verificar_pacote() -> int:
     """Modo de diagnóstico (``--verificar``): confirma que o pacote está íntegro.
 
@@ -89,6 +110,16 @@ def verificar_pacote() -> int:
             print(f"FALHOU {falha}")
         return 1
     print("Bibliotecas: todas importam.")
+
+    # O servidor HTTP é o que o navegador toca: um protocolo quebrado deixa o
+    # /healthz e o app de pé, mas nenhuma página abre.
+    neutralizar_httptools_incompleto()
+    try:
+        from uvicorn.protocols.http.auto import AutoHTTPProtocol
+    except Exception as erro:
+        print(f"FALHOU servidor HTTP: {erro}")
+        return 1
+    print(f"Servidor HTTP: {AutoHTTPProtocol.__name__}")
 
     app = caminho_do_app()
     try:
@@ -122,6 +153,7 @@ def main() -> int:
         return verificar_pacote()
 
     preparar_tesseract()
+    neutralizar_httptools_incompleto()
     app = caminho_do_app()
     porta = escolher_porta()
     print(f"Extrator Apoena — abrindo em http://localhost:{porta}")

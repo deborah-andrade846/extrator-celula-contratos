@@ -51,7 +51,11 @@ analise = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "PyQt5", "PySide2", "torch", "tensorflow"],
+    # httptools e uvloop são aceleradores opcionais do uvicorn com extensão em C; quando
+    # entram pela metade, o servidor sobe mas nenhuma conexão é atendida. O h11, puro
+    # Python, atende sozinho um programa de uso local.
+    excludes=["tkinter", "matplotlib", "PyQt5", "PySide2", "torch", "tensorflow",
+              "httptools", "uvloop"],
     noarchive=False,
 )
 
