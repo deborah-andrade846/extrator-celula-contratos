@@ -938,6 +938,14 @@ def _conferir_com_o_documento(dados: List[Dict], texto: str, arquivo: str) -> No
             f"- `{linha}`" for linha in perdidas
         )
     st.warning(_sem_cifrao_de_formula(aviso))
+    # Quando nem a lista acima explica a diferença, o texto que o OCR devolveu é o que
+    # resta para achar o defeito. Só as linhas com valor em reais: ficam de fora CPF,
+    # endereço e telefone do cabeçalho, e o trecho pode ser enviado a quem for consertar.
+    linhas_com_valor = [linha for linha in dict.fromkeys(texto.split("\n"))
+                        if re.search(r'\d[.,]\d{2}(?:\s|$)', linha)]
+    if linhas_com_valor:
+        with st.expander(f"Ver o texto que a leitura obteve de {arquivo}"):
+            st.code("\n".join(linhas_com_valor), language=None)
 
 
 # Quantas linhas descartadas mostrar: o suficiente para reconhecer o padrão do erro,
@@ -953,8 +961,11 @@ _RE_VALOR_NEGATIVO = re.compile(r'-\s?\d+[.,]\d{2}')
 def _linhas_nao_aproveitadas(texto: str) -> List[str]:
     """Linhas que parecem lançamento (começam por data) e a leitura não aproveitou."""
     perdidas = []
-    for linha in dict.fromkeys(texto.split("\n")):
-        linha = linha.strip()
+    partes = [parte
+              for linha in dict.fromkeys(texto.split("\n"))
+              if not any(palavra in linha for palavra in _CABECALHOS_HOTEL)
+              for parte in _separar_lancamentos_grudados(linha.strip())]
+    for linha in dict.fromkeys(partes):
         if limpar_linha_hotel(linha, "") is not None:
             continue
         # Começar por data é o sinal de lançamento; mas quando o OCR estragou a data
@@ -1029,6 +1040,24 @@ def remover_lancamentos_repetidos(dados: List[Dict]) -> Tuple[List[Dict], int]:
 _CABECALHOS_HOTEL = ["PLAZA HOTEL", "Apartamento:", "Fechado", "Pagamentos", "Tarifário:"]
 
 
+# Começo de um lançamento no meio da linha: data (inteira ou estragada, ver
+# _RE_DATA_ILEGIVEL) seguida da hora. Só serve para cortar, não para ler.
+_RE_INICIO_LANCAMENTO = re.compile(
+    r'\s(?=(?:\d{1,2}/\d{1,2}/\d{2,4}|\S{1,6}/\d{2})\s+\d{1,2}[:.]?\d{2}\s)')
+
+
+def _separar_lancamentos_grudados(linha: str) -> List[str]:
+    """Divide a linha em que o OCR juntou dois lançamentos.
+
+    Com as linhas da tabela muito próximas, o Tesseract às vezes lê duas como uma:
+    "19/10/26 15:41 AGUA ... 10,00 20/10/26 09:26 AGUA ... 10,00". A leitura pega os
+    números do fim, aproveita o segundo lançamento e o primeiro some sem aviso —
+    nem aparece como linha descartada, porque a linha foi aproveitada. Uma segunda
+    data seguida de hora no meio da linha é o começo de outro lançamento.
+    """
+    return [parte.strip() for parte in _RE_INICIO_LANCAMENTO.split(linha) if parte.strip()]
+
+
 def _lancamentos_do_texto(texto, identificacao):
     """Lê um bloco de texto (direto ou de OCR) e devolve (lançamentos, hóspede)."""
     registros = []
@@ -1040,9 +1069,10 @@ def _lancamentos_do_texto(texto, identificacao):
             continue
         if any(palavra in linha for palavra in _CABECALHOS_HOTEL):
             continue
-        linha_extraida = limpar_linha_hotel(linha, nome_hospede or identificacao)
-        if linha_extraida:
-            registros.append(linha_extraida)
+        for parte in _separar_lancamentos_grudados(linha):
+            linha_extraida = limpar_linha_hotel(parte, nome_hospede or identificacao)
+            if linha_extraida:
+                registros.append(linha_extraida)
     return registros, nome_hospede
 
 
