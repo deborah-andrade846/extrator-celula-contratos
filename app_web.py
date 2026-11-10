@@ -626,13 +626,28 @@ def _sem_lixo_inicial(linha: str) -> str:
     return _RE_LIXO_ANTES_DA_DATA.sub("", linha.strip())
 
 
+# O Tesseract do Windows come o espaço entre o ano e a hora: "01/10/26 16:47" chega
+# como "0110/2616:47". Sem o espaço, nem a data nem a hora são reconhecidas e a linha
+# inteira se perde. A hora aqui exige o separador (":", ".") para não partir um ano de
+# quatro dígitos ("29/10/2026") ao meio.
+_RE_HORA_COLADA_NO_ANO = re.compile(r'(?<=/\d{2})(?=\d{1,2}[:.;°]\d{2}(?:[:.]\d{2})?(?:\s|$))')
+
+
+def _descolar_hora(linha: str) -> str:
+    """Devolve o espaço que o OCR tirou entre o ano da data e a hora."""
+    return _RE_HORA_COLADA_NO_ANO.sub(" ", linha)
+
+
 # A fonte do extrato é fina e falhada justamente no "1" e na barra: o OCR lê
 # "01/10/26" como "0110/26", "05/10/26" como "05Ã0/26", "27/10/26" como "27h0/26" e
 # "11/10/26" como "N/0/26". O resto da linha sai perfeito — hora, descrição, comanda,
 # valores —, mas sem data válida o lançamento inteiro era descartado: foi assim que
 # um mês de outubro perdeu diárias e lavanderia em quase metade dos extratos. O que
 # sobra legível é o ano no fim ("/26") e, quase sempre, os dois algarismos do dia.
-_RE_DATA_ILEGIVEL = re.compile(r'^(?P<miolo>\S{1,6})/(?P<ano>\d{2})$')
+# O que vem colado depois do ano (a hora, sem espaço: "0110/2616:47") é ignorado.
+_RE_DATA_ILEGIVEL = re.compile(r'^(?P<miolo>[^/\s]{1,6}(?:/[^/\s]{1,3})?)/(?P<ano>\d{2})(?!\d)')
+# O que só a linha de lançamento tem: a Comanda (consumo) ou o Apart. (diária).
+_RE_MARCA_LANCAMENTO = re.compile(r'Comanda|Apart\b', re.IGNORECASE)
 # A hora também sai estragada: "16:41" chega como "1641", "16.41", "16-41" ou
 # "16 41". Os dois algarismos dos minutos depois de um ou dois da hora, com no
 # máximo um sinal (ou espaço) entre eles, é a forma que resiste ao OCR.
@@ -648,7 +663,10 @@ def _data_ilegivel(linha: str) -> Optional[Dict]:
     depois, com o documento inteiro à vista — ver ``_resolver_datas_ilegiveis``.
     """
     tokens = linha.split()
-    if len(tokens) < 3 or not _RE_HORA_HOTEL.match(" ".join(tokens[1:])):
+    # A hora não entra na planilha: serve só de sinal de que a linha é um lançamento.
+    # Quando ela some ou sai ilegível, a Comanda ou o Apart. dão o mesmo sinal.
+    if len(tokens) < 3 or not (_RE_HORA_HOTEL.match(" ".join(tokens[1:]))
+                               or _RE_MARCA_LANCAMENTO.search(linha)):
         return None
     achado = _RE_DATA_ILEGIVEL.match(tokens[0])
     if not achado:
@@ -688,7 +706,7 @@ def _total_pela_conta(valores: List[float]) -> float:
 
 
 def limpar_linha_hotel(linha, nome_hospede):
-    linha = _sem_lixo_inicial(linha)
+    linha = _descolar_hora(_sem_lixo_inicial(linha))
     # 1. A linha precisa começar por uma data. O dia/mês podem vir com 1 dígito
     #    porque o OCR às vezes perde um algarismo (ex.: lê "1/06/26" em vez de
     #    "11/06/26"); sem isso a linha seria descartada.
@@ -715,6 +733,9 @@ def limpar_linha_hotel(linha, nome_hospede):
     #    (ex.: "1412", "0915", "10.11").
     resto, hora_lida = re.subn(rf'^{_HORA_HOTEL}(?::\d{{2}})?(?=\s|$)\s*', '', resto)
     partes = resto.split()
+    # A hora não vai para a planilha: ilegível ("1x:4z"), ela só sujaria a descrição.
+    if not hora_lida and partes and ":" in partes[0] and len(partes[0]) <= 6:
+        partes, hora_lida = partes[1:], 1
     # 3. Coleta os tokens numéricos finais (Qtde Unidade Bruto Desc. Taxas Total).
     #    O OCR às vezes come a vírgula e devolve "100" no lugar de "1,00". Quando isso
     #    acontece com a linha toda, nenhum número é reconhecido e o lançamento some da
@@ -1090,6 +1111,7 @@ def _separar_lancamentos_grudados(linha: str) -> List[str]:
     nem aparece como linha descartada, porque a linha foi aproveitada. Uma segunda
     data seguida de hora no meio da linha é o começo de outro lançamento.
     """
+    linha = _descolar_hora(linha)
     return [parte.strip() for parte in _RE_INICIO_LANCAMENTO.split(linha) if parte.strip()]
 
 
